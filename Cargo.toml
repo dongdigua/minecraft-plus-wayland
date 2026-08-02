@@ -1,0 +1,10 @@
+[package]
+name = "minecraft-plus-wayland"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pollster = "0.4"
+raw-window-handle = "0.6.2"
+smithay-client-toolkit = { version = "0.21.1", default-features = false, features = ["system", "xkbcommon"] }
+wgpu = { version = "30.0.0", default-features = false, features = ["std", "vulkan", "gles", "wgsl"] }
