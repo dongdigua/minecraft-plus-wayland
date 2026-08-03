@@ -30,7 +30,7 @@ use smithay_client_toolkit::{
 
 use crate::{
     renderer::{RenderOutcome, Renderer},
-    scene::{FrameInfo, RenderSize, Scene, TriangleScene},
+    scene::{FrameInfo, RenderSize, Scene, SquidScene, TriangleScene},
 };
 
 const FALLBACK_SIZE: RenderSize = RenderSize {
@@ -38,14 +38,37 @@ const FALLBACK_SIZE: RenderSize = RenderSize {
     height: 720,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum StartupMode {
     LayerShell,
     SessionLock,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SceneSelection {
+    Triangle,
+    Squid,
+}
+
+impl SceneSelection {
+    fn create(self) -> Box<dyn Scene> {
+        match self {
+            Self::Triangle => Box::<TriangleScene>::default(),
+            Self::Squid => Box::<SquidScene>::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StartupOptions {
+    mode: StartupMode,
+    scene: SceneSelection,
+}
+
 pub fn run() -> Result<(), Box<dyn Error>> {
-    let startup_mode = parse_startup_mode()?;
+    let startup = parse_startup_options()?;
+    let startup_mode = startup.mode;
+    let scene_selection = startup.scene;
     let connection = Connection::connect_to_env()?;
     let (globals, mut event_queue) = registry_queue_init(&connection)?;
     let qh = event_queue.handle();
@@ -68,10 +91,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             );
             layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
             layer.set_size(0, 0);
-            layer.set_exclusive_zone(0);
+            layer.set_exclusive_zone(-1);
             layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 
-            let render = RenderState::new(Renderer::new(&connection, layer.wl_surface())?);
+            let render = RenderState::new(
+                Renderer::new(&connection, layer.wl_surface())?,
+                scene_selection,
+            );
             (
                 Mode::Layer(Box::new(LayerTarget {
                     render,
@@ -92,8 +118,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             for output in outputs {
                 let surface = compositor_state.create_surface(&qh);
                 let lock_surface = session_lock.create_lock_surface(surface, &output, &qh);
-                let render =
-                    RenderState::new(Renderer::new(&connection, lock_surface.wl_surface())?);
+                let render = RenderState::new(
+                    Renderer::new(&connection, lock_surface.wl_surface())?,
+                    scene_selection,
+                );
                 targets.push(LockTarget {
                     render,
                     output,
@@ -133,11 +161,82 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn parse_startup_mode() -> Result<StartupMode, Box<dyn Error>> {
-    match env::args().skip(1).collect::<Vec<_>>().as_slice() {
-        [] => Ok(StartupMode::LayerShell),
-        [argument] if argument == "--lock" => Ok(StartupMode::SessionLock),
-        _ => Err("Usage: minecraft-plus-wayland [--lock]".into()),
+fn parse_startup_options() -> Result<StartupOptions, Box<dyn Error>> {
+    parse_options(env::args().skip(1))
+}
+
+fn parse_options(
+    arguments: impl IntoIterator<Item = String>,
+) -> Result<StartupOptions, Box<dyn Error>> {
+    let mut mode = StartupMode::LayerShell;
+    let mut scene = SceneSelection::Triangle;
+    let mut arguments = arguments.into_iter();
+
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--lock" => mode = StartupMode::SessionLock,
+            "--scene" => {
+                let module = arguments
+                    .next()
+                    .ok_or("--scene requires a module number")?
+                    .parse::<u8>()
+                    .map_err(|_| "--scene requires an integer module number")?;
+                scene = match module {
+                    8 => SceneSelection::Squid,
+                    0..=12 => {
+                        return Err(format!(
+                            "module={module} is not implemented natively; only module=8 (squid) is available"
+                        )
+                        .into());
+                    }
+                    _ => {
+                        return Err(
+                            format!("module={module} is outside the valid range 0..=12").into()
+                        );
+                    }
+                };
+            }
+            "--help" | "-h" => {
+                return Err(
+                    "Usage: minecraft-plus-wayland [--lock] [--scene <n>]\n\n--scene 8 selects Web module=8 (squid)."
+                        .into(),
+                );
+            }
+            _ => {
+                return Err(format!(
+                    "unknown argument {argument:?}; usage: minecraft-plus-wayland [--lock] [--scene <n>]"
+                )
+                .into());
+            }
+        }
+    }
+
+    Ok(StartupOptions { mode, scene })
+}
+
+#[cfg(test)]
+mod startup_option_tests {
+    use super::{SceneSelection, StartupMode, parse_options};
+
+    #[test]
+    fn squid_scene_maps_to_module_eight() {
+        let options = parse_options(["--scene".to_owned(), "8".to_owned()]).unwrap();
+        assert!(matches!(options.mode, StartupMode::LayerShell));
+        assert!(matches!(options.scene, SceneSelection::Squid));
+    }
+
+    #[test]
+    fn lock_and_scene_are_order_independent() {
+        let options =
+            parse_options(["--scene".to_owned(), "8".to_owned(), "--lock".to_owned()]).unwrap();
+        assert!(matches!(options.mode, StartupMode::SessionLock));
+        assert!(matches!(options.scene, SceneSelection::Squid));
+    }
+
+    #[test]
+    fn other_module_numbers_are_not_silently_mapped_to_squid() {
+        let error = parse_options(["--scene".to_owned(), "7".to_owned()]).unwrap_err();
+        assert!(error.to_string().contains("module=7 is not implemented"));
     }
 }
 
@@ -152,10 +251,10 @@ struct RenderState {
 }
 
 impl RenderState {
-    fn new(renderer: Renderer) -> Self {
+    fn new(renderer: Renderer, scene_selection: SceneSelection) -> Self {
         Self {
             renderer,
-            scene: Box::<TriangleScene>::default(),
+            scene: scene_selection.create(),
             configured_size: None,
             scene_initialized: false,
             frame_pending: false,
@@ -184,7 +283,7 @@ impl RenderState {
 
         let context = self.renderer.context();
         if !self.scene_initialized {
-            self.scene.initialize(&context);
+            self.scene.initialize(&context)?;
             self.scene_initialized = true;
         }
         self.scene.resize(&context, size);

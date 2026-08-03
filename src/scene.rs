@@ -1,4 +1,8 @@
-use std::time::Duration;
+use std::{error::Error, time::Duration};
+
+mod squid;
+
+pub use squid::SquidScene;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RenderSize {
@@ -20,7 +24,9 @@ pub struct RenderContext<'a> {
 }
 
 pub trait Scene: 'static {
-    fn initialize(&mut self, _context: &RenderContext<'_>) {}
+    fn initialize(&mut self, _context: &RenderContext<'_>) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
 
     fn resize(&mut self, _context: &RenderContext<'_>, _size: RenderSize) {}
 
@@ -45,7 +51,7 @@ pub struct TriangleScene {
 }
 
 impl Scene for TriangleScene {
-    fn initialize(&mut self, context: &RenderContext<'_>) {
+    fn initialize(&mut self, context: &RenderContext<'_>) -> Result<(), Box<dyn Error>> {
         let shader = context
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -101,6 +107,7 @@ impl Scene for TriangleScene {
                 cache: None,
             },
         ));
+        Ok(())
     }
 
     fn render(
@@ -121,12 +128,7 @@ impl Scene for TriangleScene {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.015,
-                        g: 0.025,
-                        b: 0.04,
-                        a: 1.0,
-                    }),
+                    load: wgpu::LoadOp::Clear(background_color()),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -137,5 +139,14 @@ impl Scene for TriangleScene {
         });
         pass.set_pipeline(pipeline);
         pass.draw(0..3, 0..1);
+    }
+}
+
+pub(super) fn background_color() -> wgpu::Color {
+    wgpu::Color {
+        r: 0.015,
+        g: 0.025,
+        b: 0.04,
+        a: 1.0,
     }
 }

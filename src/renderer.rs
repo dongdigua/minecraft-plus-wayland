@@ -111,7 +111,10 @@ impl Renderer {
             .surface
             .get_default_config(&self.adapter, size.width.max(1), size.height.max(1))
             .ok_or("the selected adapter does not support the layer surface")?;
-        if capabilities.present_modes.contains(&wgpu::PresentMode::Fifo) {
+        if capabilities
+            .present_modes
+            .contains(&wgpu::PresentMode::Fifo)
+        {
             config.present_mode = wgpu::PresentMode::Fifo;
         }
         config.desired_maximum_frame_latency = 1;
