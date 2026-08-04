@@ -3,7 +3,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use super::{FrameInfo, RenderContext, Scene};
+use super::{FrameInfo, Module, RenderContext};
 
 const SQUID_ATLAS_WIDTH: u32 = 128;
 const SQUID_ATLAS_HEIGHT: u32 = 640;
@@ -12,16 +12,16 @@ const SQUID_INSTANCE_COUNT: u32 = 32;
 /// Native wgpu implementation of Web module=8.
 ///
 /// The size, run duration, position, animation cycle, and atlas variant are
-/// deliberately calculated in the vertex shader from one stable scene seed
-/// and `instance_index`, matching the original WebGL scene's model.
-pub struct SquidScene {
+/// deliberately calculated in the vertex shader from one stable module seed
+/// and `instance_index`, matching the original WebGL module's model.
+pub struct SquidModule {
     pipeline: Option<wgpu::RenderPipeline>,
     bind_group: Option<wgpu::BindGroup>,
     uniforms: Option<wgpu::Buffer>,
     seed: f32,
 }
 
-impl Default for SquidScene {
+impl Default for SquidModule {
     fn default() -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -36,7 +36,7 @@ impl Default for SquidScene {
     }
 }
 
-impl Scene for SquidScene {
+impl Module for SquidModule {
     fn initialize(&mut self, context: &RenderContext<'_>) -> Result<(), Box<dyn Error>> {
         let atlas = crate::resources::load_rgba_png("squids.png")?;
         if atlas.dimensions() != (SQUID_ATLAS_WIDTH, SQUID_ATLAS_HEIGHT) {
@@ -215,15 +215,15 @@ impl Scene for SquidScene {
         let pipeline = self
             .pipeline
             .as_ref()
-            .expect("SquidScene was not initialized");
+            .expect("SquidModule was not initialized");
         let bind_group = self
             .bind_group
             .as_ref()
-            .expect("SquidScene was not initialized");
+            .expect("SquidModule was not initialized");
         let uniforms = self
             .uniforms
             .as_ref()
-            .expect("SquidScene was not initialized");
+            .expect("SquidModule was not initialized");
         context.queue.write_buffer(
             uniforms,
             0,
@@ -236,13 +236,18 @@ impl Scene for SquidScene {
         );
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("squid scene"),
+            label: Some("squid module"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear( wgpu::Color {r: 0.0, g: 0.0, b: 0.0, a: 1.0}),
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    }),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -266,7 +271,7 @@ fn uniform_bytes(time: f32, width: f32, height: f32, seed: f32) -> [u8; 16] {
 }
 
 const SQUID_SHADER: &str = r#"
-struct SceneUniforms {
+struct ModuleUniforms {
     time: f32,
     width: f32,
     height: f32,
@@ -278,12 +283,12 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
 };
 
-@group(0) @binding(0) var<uniform> scene: SceneUniforms;
+@group(0) @binding(0) var<uniform> uniforms: ModuleUniforms;
 @group(0) @binding(1) var squid_atlas: texture_2d<f32>;
 @group(0) @binding(2) var squid_sampler: sampler;
 
 fn rand(value: f32) -> f32 {
-    return fract(sin(value * 12.9898 + scene.seed) * 43758.5453);
+    return fract(sin(value * 12.9898 + uniforms.seed) * 43758.5453);
 }
 
 @vertex
@@ -314,11 +319,11 @@ fn vs_main(
     let scale = max(0.5, 2.5 * rand(17.0 * fid + 3.0 + 7.0));
     let run_duration = max(2.0 / scale, 1.0) * (5.0 + 30.0 * rand(7.0 * fid + 2.0));
     let time_offset = 3.0 + 5.0 * rand(23.0 * fid + 1.0);
-    let run = (scene.time + time_offset) / run_duration;
+    let run = (uniforms.time + time_offset) / run_duration;
     let run_integer = floor(run);
     let cycles_per_run = max(2.0 / scale, 1.0)
         * (5.0 + 6.0 * rand(3.0 * fid + 11.0 + 3.0 * run_integer));
-    let delta_y = scene.height * (2.0 * rand(13.0 * fid + 5.0 * run_integer) - 1.0);
+    let delta_y = uniforms.height * (2.0 * rand(13.0 * fid + 5.0 * run_integer) - 1.0);
     let variant = floor(min(run_integer / 30.0, 1.0)
         * 1.02 * rand(7.0 * fid + 2.0 * run_integer));
 
@@ -327,16 +332,16 @@ fn vs_main(
     let frame = floor(cycle_phase * 10.0);
     let progress = (floor(cycle) + pow(cycle_phase, 8.0)) / cycles_per_run;
     let sprite_size = 64.0 * scale;
-    let x = (1.0 - progress) * (scene.width + sprite_size) - sprite_size;
-    let y = (1.0 - progress) * scene.height + delta_y;
+    let x = (1.0 - progress) * (uniforms.width + sprite_size) - sprite_size;
+    let y = (1.0 - progress) * uniforms.height + delta_y;
     // The original module=8 shader applies scale and translation only. In
     // particular, it does not rotate or swap vPosition's axes.
     let pixel_position = positions[vertex_index] * scale + vec2<f32>(x, y);
 
     var output: VertexOutput;
     output.position = vec4<f32>(
-        pixel_position.x * 2.0 / scene.width - 1.0,
-        pixel_position.y * 2.0 / scene.height - 1.0,
+        pixel_position.x * 2.0 / uniforms.width - 1.0,
+        pixel_position.y * 2.0 / uniforms.height - 1.0,
         // WebGPU clips negative Z whereas WebGL accepts the original
         // `-scale / 4.0`; no depth buffer is used, so preserve visibility.
         0.0,

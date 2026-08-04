@@ -8,7 +8,7 @@ use smithay_client_toolkit::reexports::client::{
     Connection, Proxy, protocol::wl_surface::WlSurface,
 };
 
-use crate::scene::{FrameInfo, RenderContext, RenderSize, Scene};
+use crate::modules::{FrameInfo, Module, RenderContext, RenderSize};
 
 type RendererResult<T> = Result<T, Box<dyn Error>>;
 
@@ -125,7 +125,7 @@ impl Renderer {
 
     pub fn render(
         &mut self,
-        scene: &mut dyn Scene,
+        module: &mut dyn Module,
         frame: FrameInfo,
     ) -> RendererResult<RenderOutcome> {
         let Some(config) = self.config.as_ref() else {
@@ -167,7 +167,7 @@ impl Renderer {
                 label: Some("minecraft-plus-wayland frame"),
             });
         let context = self.context();
-        scene.render(&context, &mut encoder, &view, frame);
+        module.render(&context, &mut encoder, &view, frame);
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(surface_texture);
 

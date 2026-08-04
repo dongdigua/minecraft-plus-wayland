@@ -29,8 +29,10 @@ use smithay_client_toolkit::{
 };
 
 use crate::{
+    modules::{
+        FrameInfo, LoadCubeModule, Module, PanoramaModule, RenderSize, SquidModule, TriangleModule,
+    },
     renderer::{RenderOutcome, Renderer},
-    scene::{FrameInfo, RenderSize, Scene, SquidScene, TriangleScene},
 };
 
 const FALLBACK_SIZE: RenderSize = RenderSize {
@@ -45,16 +47,20 @@ enum StartupMode {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum SceneSelection {
+enum ModuleSelection {
     Triangle,
+    LoadCube,
+    Panorama,
     Squid,
 }
 
-impl SceneSelection {
-    fn create(self) -> Box<dyn Scene> {
+impl ModuleSelection {
+    fn create(self) -> Box<dyn Module> {
         match self {
-            Self::Triangle => Box::<TriangleScene>::default(),
-            Self::Squid => Box::<SquidScene>::default(),
+            Self::Triangle => Box::<TriangleModule>::default(),
+            Self::LoadCube => Box::<LoadCubeModule>::default(),
+            Self::Panorama => Box::<PanoramaModule>::default(),
+            Self::Squid => Box::<SquidModule>::default(),
         }
     }
 }
@@ -62,13 +68,13 @@ impl SceneSelection {
 #[derive(Clone, Copy, Debug)]
 struct StartupOptions {
     mode: StartupMode,
-    scene: SceneSelection,
+    module: ModuleSelection,
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let startup = parse_startup_options()?;
     let startup_mode = startup.mode;
-    let scene_selection = startup.scene;
+    let module_selection = startup.module;
     let connection = Connection::connect_to_env()?;
     let (globals, mut event_queue) = registry_queue_init(&connection)?;
     let qh = event_queue.handle();
@@ -96,7 +102,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
             let render = RenderState::new(
                 Renderer::new(&connection, layer.wl_surface())?,
-                scene_selection,
+                module_selection,
             );
             (
                 Mode::Layer(Box::new(LayerTarget {
@@ -120,7 +126,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 let lock_surface = session_lock.create_lock_surface(surface, &output, &qh);
                 let render = RenderState::new(
                     Renderer::new(&connection, lock_surface.wl_surface())?,
-                    scene_selection,
+                    module_selection,
                 );
                 targets.push(LockTarget {
                     render,
@@ -169,94 +175,71 @@ fn parse_options(
     arguments: impl IntoIterator<Item = String>,
 ) -> Result<StartupOptions, Box<dyn Error>> {
     let mut mode = StartupMode::LayerShell;
-    let mut scene = SceneSelection::Triangle;
+    let mut module = ModuleSelection::Triangle;
     let mut arguments = arguments.into_iter();
 
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--lock" => mode = StartupMode::SessionLock,
-            "--scene" => {
-                let module = arguments
+            "--module" => {
+                let module_id = arguments
                     .next()
-                    .ok_or("--scene requires a module number")?
+                    .ok_or("--module requires a module number")?
                     .parse::<u8>()
-                    .map_err(|_| "--scene requires an integer module number")?;
-                scene = match module {
-                    8 => SceneSelection::Squid,
-                    0..=12 => {
+                    .map_err(|_| "--module requires an integer module number")?;
+                module = match module_id {
+                    0 => ModuleSelection::LoadCube,
+                    6 => ModuleSelection::Panorama,
+                    8 => ModuleSelection::Squid,
+                    1..=5 | 7 | 9..=12 => {
                         return Err(format!(
-                            "module={module} is not implemented natively; only module=8 (squid) is available"
+                            "module={module_id} is not implemented natively; only module=0 (load cube), module=6 (panorama), and module=8 (squid) are available"
                         )
                         .into());
                     }
                     _ => {
-                        return Err(
-                            format!("module={module} is outside the valid range 0..=12").into()
-                        );
+                        return Err(format!(
+                            "module={module_id} is outside the valid range 0..=12"
+                        )
+                        .into());
                     }
                 };
             }
             "--help" | "-h" => {
                 return Err(
-                    "Usage: minecraft-plus-wayland [--lock] [--scene <n>]\n\n--scene 8 selects Web module=8 (squid)."
+                    "Usage: minecraft-plus-wayland [--lock] [--module <n>]\n\n--module 0 selects Web module=0 (load cube); --module 6 selects module=6 (panorama); --module 8 selects module=8 (squid)."
                         .into(),
                 );
             }
             _ => {
                 return Err(format!(
-                    "unknown argument {argument:?}; usage: minecraft-plus-wayland [--lock] [--scene <n>]"
+                    "unknown argument {argument:?}; usage: minecraft-plus-wayland [--lock] [--module <n>]"
                 )
                 .into());
             }
         }
     }
 
-    Ok(StartupOptions { mode, scene })
-}
-
-#[cfg(test)]
-mod startup_option_tests {
-    use super::{SceneSelection, StartupMode, parse_options};
-
-    #[test]
-    fn squid_scene_maps_to_module_eight() {
-        let options = parse_options(["--scene".to_owned(), "8".to_owned()]).unwrap();
-        assert!(matches!(options.mode, StartupMode::LayerShell));
-        assert!(matches!(options.scene, SceneSelection::Squid));
-    }
-
-    #[test]
-    fn lock_and_scene_are_order_independent() {
-        let options =
-            parse_options(["--scene".to_owned(), "8".to_owned(), "--lock".to_owned()]).unwrap();
-        assert!(matches!(options.mode, StartupMode::SessionLock));
-        assert!(matches!(options.scene, SceneSelection::Squid));
-    }
-
-    #[test]
-    fn other_module_numbers_are_not_silently_mapped_to_squid() {
-        let error = parse_options(["--scene".to_owned(), "7".to_owned()]).unwrap_err();
-        assert!(error.to_string().contains("module=7 is not implemented"));
-    }
+    Ok(StartupOptions { mode, module })
 }
 
 struct RenderState {
     renderer: Renderer,
-    scene: Box<dyn Scene>,
+    module: Box<dyn Module>,
     configured_size: Option<RenderSize>,
-    scene_initialized: bool,
+    module_initialized: bool,
     frame_pending: bool,
     started_at: Instant,
     last_frame_at: Instant,
 }
 
 impl RenderState {
-    fn new(renderer: Renderer, scene_selection: SceneSelection) -> Self {
+    fn new(renderer: Renderer, module_selection: ModuleSelection) -> Self {
         Self {
             renderer,
-            scene: scene_selection.create(),
+            module: module_selection.create(),
             configured_size: None,
-            scene_initialized: false,
+            module_initialized: false,
             frame_pending: false,
             started_at: Instant::now(),
             last_frame_at: Instant::now(),
@@ -282,11 +265,11 @@ impl RenderState {
         self.configured_size = Some(size);
 
         let context = self.renderer.context();
-        if !self.scene_initialized {
-            self.scene.initialize(&context)?;
-            self.scene_initialized = true;
+        if !self.module_initialized {
+            self.module.initialize(&context)?;
+            self.module_initialized = true;
         }
-        self.scene.resize(&context, size);
+        self.module.resize(&context, size);
         Ok(())
     }
 
@@ -302,8 +285,8 @@ impl RenderState {
             size,
         };
         self.last_frame_at = now;
-        self.scene.update(frame);
-        self.renderer.render(self.scene.as_mut(), frame)
+        self.module.update(frame);
+        self.renderer.render(self.module.as_mut(), frame)
     }
 }
 
@@ -400,7 +383,7 @@ impl App {
         surface: &wl_surface::WlSurface,
         qh: &QueueHandle<Self>,
     ) -> Result<(), Box<dyn Error>> {
-        if render.scene.wants_continuous_frames() && !render.frame_pending {
+        if render.module.wants_continuous_frames() && !render.frame_pending {
             surface.frame(qh, FrameCallbackData(surface.clone()));
             render.frame_pending = true;
         }

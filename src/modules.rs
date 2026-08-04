@@ -1,8 +1,12 @@
 use std::{error::Error, time::Duration};
 
+mod load_cube;
+mod panorama;
 mod squid;
 
-pub use squid::SquidScene;
+pub use load_cube::LoadCubeModule;
+pub use panorama::PanoramaModule;
+pub use squid::SquidModule;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RenderSize {
@@ -23,7 +27,7 @@ pub struct RenderContext<'a> {
     pub surface_format: wgpu::TextureFormat,
 }
 
-pub trait Scene: 'static {
+pub trait Module: 'static {
     fn initialize(&mut self, _context: &RenderContext<'_>) -> Result<(), Box<dyn Error>> {
         Ok(())
     }
@@ -46,11 +50,11 @@ pub trait Scene: 'static {
 }
 
 #[derive(Default)]
-pub struct TriangleScene {
+pub struct TriangleModule {
     pipeline: Option<wgpu::RenderPipeline>,
 }
 
-impl Scene for TriangleScene {
+impl Module for TriangleModule {
     fn initialize(&mut self, context: &RenderContext<'_>) -> Result<(), Box<dyn Error>> {
         let shader = context
             .device
@@ -120,9 +124,9 @@ impl Scene for TriangleScene {
         let pipeline = self
             .pipeline
             .as_ref()
-            .expect("TriangleScene was not initialized");
+            .expect("TriangleModule was not initialized");
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("triangle scene"),
+            label: Some("triangle module"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 depth_slice: None,
