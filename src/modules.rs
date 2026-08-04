@@ -1,6 +1,7 @@
 use std::{error::Error, time::Duration};
 
 mod alpha_fluids;
+mod blocks;
 mod creeper;
 mod grass;
 mod load_cube;
@@ -8,6 +9,7 @@ mod panorama;
 mod squid;
 
 pub use alpha_fluids::{AlphaFluidVariant, AlphaFluidsModule};
+pub use blocks::BlocksModule;
 pub use creeper::CreeperModule;
 pub use grass::GrassModule;
 pub use load_cube::LoadCubeModule;
