@@ -560,6 +560,8 @@ fn camera(t: f32, s: RenderSize, height: f32) -> [f32; 16] {
     )
 }
 fn perspective(f: f32, a: f32, n: f32, z: f32) -> [f32; 16] {
+    // This is already a WebGPU [0,w] clip-depth projection, not a verbatim
+    // WebGL [-w,w] matrix: view-space near maps to z=0 and far maps to z=w.
     let q = 1. / (f * 0.5).tan();
     [
         q / a,
@@ -730,6 +732,23 @@ mod tests {
         assert!((matrix[1] - -0.508_765_4).abs() < 0.000_001);
         assert!((matrix[8] - -0.802_979_65).abs() < 0.000_001);
         assert!((matrix[9] - 0.015_099_806).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn perspective_maps_near_and_far_to_webgpu_clip_depth() {
+        let near = 0.001;
+        let far = 50.0;
+        let matrix = super::perspective(70f32.to_radians(), 16.0 / 9.0, near, far);
+        let clip_depth = |view_z: f32| {
+            let clip_z = matrix[10] * view_z + matrix[14];
+            let clip_w = matrix[11] * view_z + matrix[15];
+            (clip_z, clip_w)
+        };
+        let (near_z, near_w) = clip_depth(near);
+        let (far_z, far_w) = clip_depth(far);
+        assert!(near_z.abs() < 1e-7);
+        assert!((far_z - far_w).abs() < 1e-5);
+        assert!(near_w > 0.0 && far_w > near_w);
     }
 
     #[test]

@@ -31,8 +31,8 @@ use smithay_client_toolkit::{
 use crate::{
     modules::{
         AlphaFluidVariant, AlphaFluidsModule, BlocksModule, CreeperModule, DvdBounceModule,
-        DvdBounceVariant, FootprintModule, FrameInfo, GrassModule, ItemPopModule, LoadCubeModule,
-        Module, PanoramaModule, RenderSize, SquidModule, TriangleModule,
+        DvdBounceVariant, FootprintModule, FrameInfo, GrassModule, ItemBounceModule, ItemPopModule,
+        LoadCubeModule, Module, PanoramaModule, RenderSize, SquidModule, TriangleModule,
     },
     renderer::{RenderOutcome, Renderer},
 };
@@ -53,6 +53,7 @@ enum ModuleSelection {
     Triangle,
     LoadCube,
     ItemPop,
+    ItemBounce,
     DvdBounce(DvdBounceVariant),
     AlphaFluids(AlphaFluidVariant),
     Panorama,
@@ -69,6 +70,7 @@ impl ModuleSelection {
             Self::Triangle => Box::<TriangleModule>::default(),
             Self::LoadCube => Box::<LoadCubeModule>::default(),
             Self::ItemPop => Box::<ItemPopModule>::default(),
+            Self::ItemBounce => Box::<ItemBounceModule>::default(),
             Self::DvdBounce(variant) => Box::new(DvdBounceModule::new(variant)),
             Self::AlphaFluids(variant) => Box::new(AlphaFluidsModule::new(variant)),
             Self::Panorama => Box::<PanoramaModule>::default(),
@@ -212,16 +214,11 @@ fn parse_options(
                     5 => ModuleSelection::AlphaFluids(AlphaFluidVariant::Lava),
                     6 => ModuleSelection::Panorama,
                     7 => ModuleSelection::Footprint,
+                    8 => ModuleSelection::Squid,
+                    9 => ModuleSelection::ItemBounce,
                     10 => ModuleSelection::Grass,
                     11 => ModuleSelection::Blocks,
-                    8 => ModuleSelection::Squid,
                     12 => ModuleSelection::Creeper,
-                    9 => {
-                        return Err(format!(
-                            "module={module_id} is not implemented natively; only module=0 (load cube), module=1 (dvd bounce trail), module=2 (dvd bounce direct), module=3 (item pop), module=4 (alpha fluids water), module=5 (alpha fluids lava), module=6 (panorama), module=7 (footprint), module=8 (squid), module=10 (grass), module=11 (blocks), and module=12 (creeper) are available"
-                        )
-                        .into());
-                    }
                     _ => {
                         return Err(format!(
                             "module={module_id} is outside the valid range 0..=12"
@@ -232,7 +229,7 @@ fn parse_options(
             }
             "--help" | "-h" => {
                 return Err(
-                    "Usage: minecraft-plus-wayland [--lock] [--module <n>]\n\n--module 0 selects Web module=0 (load cube); --module 1 selects module=1 (dvd bounce trail); --module 2 selects module=2 (dvd bounce direct); --module 3 selects module=3 (item pop); --module 4 selects module=4 (alpha fluids water); --module 5 selects module=5 (alpha fluids lava); --module 6 selects module=6 (panorama); --module 7 selects module=7 (footprint); --module 8 selects module=8 (squid); --module 10 selects module=10 (grass); --module 11 selects module=11 (blocks); --module 12 selects module=12 (creeper)."
+                    "Usage: minecraft-plus-wayland [--lock] [--module <n>]\n\n--module 0 selects Web module=0 (load cube); --module 1 selects module=1 (dvd bounce trail); --module 2 selects module=2 (dvd bounce direct); --module 3 selects module=3 (item pop); --module 4 selects module=4 (alpha fluids water); --module 5 selects module=5 (alpha fluids lava); --module 6 selects module=6 (panorama); --module 7 selects module=7 (footprint); --module 8 selects module=8 (squid); --module 9 selects module=9 (item bounce); --module 10 selects module=10 (grass); --module 11 selects module=11 (blocks); --module 12 selects module=12 (creeper)."
                         .into(),
                 );
             }
