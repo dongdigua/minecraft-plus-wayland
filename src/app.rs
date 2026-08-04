@@ -30,8 +30,9 @@ use smithay_client_toolkit::{
 
 use crate::{
     modules::{
-        AlphaFluidVariant, AlphaFluidsModule, BlocksModule, CreeperModule, FrameInfo, GrassModule,
-        LoadCubeModule, Module, PanoramaModule, RenderSize, SquidModule, TriangleModule,
+        AlphaFluidVariant, AlphaFluidsModule, BlocksModule, CreeperModule, FootprintModule,
+        FrameInfo, GrassModule, LoadCubeModule, Module, PanoramaModule, RenderSize, SquidModule,
+        TriangleModule,
     },
     renderer::{RenderOutcome, Renderer},
 };
@@ -53,6 +54,7 @@ enum ModuleSelection {
     LoadCube,
     AlphaFluids(AlphaFluidVariant),
     Panorama,
+    Footprint,
     Grass,
     Blocks,
     Squid,
@@ -66,6 +68,7 @@ impl ModuleSelection {
             Self::LoadCube => Box::<LoadCubeModule>::default(),
             Self::AlphaFluids(variant) => Box::new(AlphaFluidsModule::new(variant)),
             Self::Panorama => Box::<PanoramaModule>::default(),
+            Self::Footprint => Box::<FootprintModule>::default(),
             Self::Grass => Box::<GrassModule>::default(),
             Self::Blocks => Box::<BlocksModule>::default(),
             Self::Squid => Box::<SquidModule>::default(),
@@ -201,13 +204,14 @@ fn parse_options(
                     4 => ModuleSelection::AlphaFluids(AlphaFluidVariant::Water),
                     5 => ModuleSelection::AlphaFluids(AlphaFluidVariant::Lava),
                     6 => ModuleSelection::Panorama,
+                    7 => ModuleSelection::Footprint,
                     10 => ModuleSelection::Grass,
                     11 => ModuleSelection::Blocks,
                     8 => ModuleSelection::Squid,
                     12 => ModuleSelection::Creeper,
-                    1..=3 | 7 | 9 => {
+                    1..=3 | 9 => {
                         return Err(format!(
-                            "module={module_id} is not implemented natively; only module=0 (load cube), module=4 (alpha fluids water), module=5 (alpha fluids lava), module=6 (panorama), module=8 (squid), module=10 (grass), module=11 (blocks), and module=12 (creeper) are available"
+                            "module={module_id} is not implemented natively; only module=0 (load cube), module=4 (alpha fluids water), module=5 (alpha fluids lava), module=6 (panorama), module=7 (footprint), module=8 (squid), module=10 (grass), module=11 (blocks), and module=12 (creeper) are available"
                         )
                         .into());
                     }
@@ -221,7 +225,7 @@ fn parse_options(
             }
             "--help" | "-h" => {
                 return Err(
-                    "Usage: minecraft-plus-wayland [--lock] [--module <n>]\n\n--module 0 selects Web module=0 (load cube); --module 4 selects module=4 (alpha fluids water); --module 5 selects module=5 (alpha fluids lava); --module 6 selects module=6 (panorama); --module 8 selects module=8 (squid); --module 10 selects module=10 (grass); --module 11 selects module=11 (blocks); --module 12 selects module=12 (creeper)."
+                    "Usage: minecraft-plus-wayland [--lock] [--module <n>]\n\n--module 0 selects Web module=0 (load cube); --module 4 selects module=4 (alpha fluids water); --module 5 selects module=5 (alpha fluids lava); --module 6 selects module=6 (panorama); --module 7 selects module=7 (footprint); --module 8 selects module=8 (squid); --module 10 selects module=10 (grass); --module 11 selects module=11 (blocks); --module 12 selects module=12 (creeper)."
                         .into(),
                 );
             }
