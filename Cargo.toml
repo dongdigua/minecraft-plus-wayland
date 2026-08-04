@@ -6,6 +6,10 @@ edition = "2024"
 [dependencies]
 image = { version = "0.25.8", default-features = false, features = ["png"] }
 pollster = "0.4"
+# Match the Web WASM's rand 0.6 / HC-128 random stream rather than using
+# local substitutes for module state evolution.
+rand = "0.6.5"
+rand_hc = "0.1.0"
 raw-window-handle = "0.6.2"
 smithay-client-toolkit = { version = "0.21.1", default-features = false, features = ["system", "xkbcommon"] }
 wasmi = { version = "1.1.0", default-features = false, features = ["std"] }

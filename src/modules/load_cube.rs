@@ -1,7 +1,7 @@
-use std::{
-    error::Error,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::error::Error;
+
+use rand::{RngCore, SeedableRng};
+use rand_hc::Hc128Rng;
 
 use super::{FrameInfo, Module, RenderContext, RenderSize};
 
@@ -34,7 +34,7 @@ impl Default for LoadCubeModule {
             uniforms: None,
             depth: None,
             // Replaced with the parsed atlas specification in initialize().
-            state: CubeState::new(32, 463, seed_from_clock()),
+            state: CubeState::new(32, 463, [0; 32]),
         }
     }
 }
@@ -56,11 +56,7 @@ impl Module for LoadCubeModule {
             .into());
         }
 
-        self.state = CubeState::new(
-            atlas_spec.line_width,
-            atlas_spec.slot_count,
-            seed_from_clock(),
-        );
+        self.state = CubeState::new(atlas_spec.line_width, atlas_spec.slot_count, random_seed());
 
         let texture = context.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("load-cube block atlas"),
@@ -361,12 +357,12 @@ struct CubeState {
     offsets: [[f32; 2]; STORED_OFFSET_COUNT],
     direction: u8,
     last_run: u64,
-    random: SplitMix64,
+    random: Hc128Rng,
 }
 
 impl CubeState {
-    fn new(line_width: u32, slot_count: u32, seed: u64) -> Self {
-        let mut random = SplitMix64::new(seed);
+    fn new(line_width: u32, slot_count: u32, seed: [u8; 32]) -> Self {
+        let mut random = Hc128Rng::from_seed(seed);
         let mut offsets = [[0.0; 2]; STORED_OFFSET_COUNT];
         for offset in &mut offsets {
             *offset = random_offset(&mut random, line_width, slot_count);
@@ -413,28 +409,16 @@ impl CubeState {
     }
 }
 
-/// A local random stream keeps the module dependency-free. Its rejection logic
-/// intentionally matches the original module's unbiased 463-way and four-way
-/// selection rules; only the seeded generator differs from Web rand_hc.
-struct SplitMix64 {
-    state: u64,
+/// The original Web module's `rand_hc` core consumes 32 bytes of entropy at
+/// startup. Use the same HC-128 core and seed width; native entropy means a
+/// launch is not expected to reproduce a particular Web launch's sequence.
+fn random_seed() -> [u8; 32] {
+    let mut seed = [0; 32];
+    rand::thread_rng().fill_bytes(&mut seed);
+    seed
 }
 
-impl SplitMix64 {
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut value = self.state;
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        (value ^ (value >> 31)) as u32
-    }
-}
-
-fn random_offset(random: &mut SplitMix64, line_width: u32, slot_count: u32) -> [f32; 2] {
+fn random_offset(random: &mut Hc128Rng, line_width: u32, slot_count: u32) -> [f32; 2] {
     let zone = slot_count << slot_count.leading_zeros();
     let slot = loop {
         let product = u64::from(slot_count) * u64::from(random.next_u32());
@@ -446,20 +430,13 @@ fn random_offset(random: &mut SplitMix64, line_width: u32, slot_count: u32) -> [
     [(slot - row * line_width) as f32, row as f32]
 }
 
-fn random_direction(random: &mut SplitMix64) -> u8 {
+fn random_direction(random: &mut Hc128Rng) -> u8 {
     loop {
         let value = random.next_u32();
         if value & (1 << 29) == 0 {
             return (value >> 30) as u8 + 1;
         }
     }
-}
-
-fn seed_from_clock() -> u64 {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    duration.as_secs() ^ u64::from(duration.subsec_nanos()).rotate_left(32)
 }
 
 fn smootherstep(value: f32) -> f32 {
@@ -612,7 +589,7 @@ mod tests {
 
     #[test]
     fn transition_moves_current_directional_face_to_front() {
-        let mut state = CubeState::new(32, 463, 7);
+        let mut state = CubeState::new(32, 463, [7; 32]);
         state.offsets = [
             [0.0, 0.0],
             [1.0, 0.0],
@@ -631,7 +608,7 @@ mod tests {
 
     #[test]
     fn offset_selection_stays_inside_manifest_range() {
-        let mut random = SplitMix64::new(42);
+        let mut random = Hc128Rng::from_seed([42; 32]);
         for _ in 0..10_000 {
             let offset = random_offset(&mut random, 32, 463);
             let id = offset[1] as u32 * 32 + offset[0] as u32;

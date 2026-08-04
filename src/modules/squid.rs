@@ -1,7 +1,6 @@
-use std::{
-    error::Error,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::error::Error;
+
+use rand::Rng;
 
 use super::{FrameInfo, Module, RenderContext};
 
@@ -23,15 +22,11 @@ pub struct SquidModule {
 
 impl Default for SquidModule {
     fn default() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
         Self {
             pipeline: None,
             bind_group: None,
             uniforms: None,
-            seed: nanos as f32 / 1_000_000_000.0,
+            seed: random_seed(),
         }
     }
 }
@@ -260,6 +255,12 @@ impl Module for SquidModule {
         pass.set_bind_group(0, bind_group, &[]);
         pass.draw(0..6, 0..SQUID_INSTANCE_COUNT);
     }
+}
+
+/// Match the Web module's `thread_rng().gen::<f32>()`: rand 0.6 uses the
+/// HC-128-backed thread RNG and maps the upper 24 bits to `[0, 1)`.
+fn random_seed() -> f32 {
+    rand::thread_rng().r#gen()
 }
 
 fn uniform_bytes(time: f32, width: f32, height: f32, seed: f32) -> [u8; 16] {
