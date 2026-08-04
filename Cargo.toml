@@ -8,5 +8,6 @@ image = { version = "0.25.8", default-features = false, features = ["png"] }
 pollster = "0.4"
 raw-window-handle = "0.6.2"
 smithay-client-toolkit = { version = "0.21.1", default-features = false, features = ["system", "xkbcommon"] }
+wasmi = { version = "1.1.0", default-features = false, features = ["std"] }
 wgpu = { version = "30.0.0", default-features = false, features = ["std", "vulkan", "gles", "wgsl"] }
 zip = { version = "2.2.2", default-features = false, features = ["deflate"] }

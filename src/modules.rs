@@ -1,10 +1,12 @@
 use std::{error::Error, time::Duration};
 
+mod alpha_fluids;
 mod creeper;
 mod load_cube;
 mod panorama;
 mod squid;
 
+pub use alpha_fluids::{AlphaFluidVariant, AlphaFluidsModule};
 pub use creeper::CreeperModule;
 pub use load_cube::LoadCubeModule;
 pub use panorama::PanoramaModule;
