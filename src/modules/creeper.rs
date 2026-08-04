@@ -1,7 +1,7 @@
-use std::{
-    error::Error,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::error::Error;
+
+use rand::{RngCore, SeedableRng};
+use rand_hc::Hc128Rng;
 
 use super::{FrameInfo, Module, RenderContext, RenderSize};
 
@@ -17,8 +17,9 @@ const UNIFORM_BYTES: usize = 32;
 ///
 /// Each of the original module's 512 sprites derives its fixed target and
 /// phase from a single launch seed plus its instance index.  The native module
-/// retains that shader-side model; only the launch seed generator differs from
-/// the Web build's common RNG.
+/// retains that shader-side model and uses the same HC-128 RNG core as the
+/// Web build. Native entropy still prevents reproducing one particular Web
+/// launch's seed.
 pub struct CreeperModule {
     pipeline: Option<wgpu::RenderPipeline>,
     bind_group: Option<wgpu::BindGroup>,
@@ -34,7 +35,7 @@ impl Default for CreeperModule {
             bind_group: None,
             uniforms: None,
             depth: None,
-            seed: seed_from_clock(),
+            seed: random_seed(),
         }
     }
 }
@@ -310,19 +311,14 @@ impl DepthTarget {
     }
 }
 
-fn seed_from_clock() -> f32 {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let mixed = splitmix64((elapsed.as_secs() << 32) ^ u64::from(elapsed.subsec_nanos()));
-    (mixed >> 40) as f32 / 16_777_216.0
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
+/// Use the Web build's rand 0.6 HC-128 core. The 32-byte native entropy seed
+/// cannot reproduce a browser launch, but `next_u32() >> 8` uses the same
+/// 24-bit `[0, 1)` conversion captured from module=12's WASM setup path.
+fn random_seed() -> f32 {
+    let mut entropy = [0; 32];
+    rand::thread_rng().fill_bytes(&mut entropy);
+    let mut random = Hc128Rng::from_seed(entropy);
+    (random.next_u32() >> 8) as f32 / 16_777_216.0
 }
 
 fn uniform_bytes(time: f32, seed: f32, width: f32, height: f32) -> [u8; UNIFORM_BYTES] {
