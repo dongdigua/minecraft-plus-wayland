@@ -30,7 +30,8 @@ use smithay_client_toolkit::{
 
 use crate::{
     modules::{
-        FrameInfo, LoadCubeModule, Module, PanoramaModule, RenderSize, SquidModule, TriangleModule,
+        CreeperModule, FrameInfo, LoadCubeModule, Module, PanoramaModule, RenderSize, SquidModule,
+        TriangleModule,
     },
     renderer::{RenderOutcome, Renderer},
 };
@@ -52,6 +53,7 @@ enum ModuleSelection {
     LoadCube,
     Panorama,
     Squid,
+    Creeper,
 }
 
 impl ModuleSelection {
@@ -61,6 +63,7 @@ impl ModuleSelection {
             Self::LoadCube => Box::<LoadCubeModule>::default(),
             Self::Panorama => Box::<PanoramaModule>::default(),
             Self::Squid => Box::<SquidModule>::default(),
+            Self::Creeper => Box::<CreeperModule>::default(),
         }
     }
 }
@@ -191,9 +194,10 @@ fn parse_options(
                     0 => ModuleSelection::LoadCube,
                     6 => ModuleSelection::Panorama,
                     8 => ModuleSelection::Squid,
-                    1..=5 | 7 | 9..=12 => {
+                    12 => ModuleSelection::Creeper,
+                    1..=5 | 7 | 9..=11 => {
                         return Err(format!(
-                            "module={module_id} is not implemented natively; only module=0 (load cube), module=6 (panorama), and module=8 (squid) are available"
+                            "module={module_id} is not implemented natively; only module=0 (load cube), module=6 (panorama), module=8 (squid), and module=12 (creeper) are available"
                         )
                         .into());
                     }
@@ -207,7 +211,7 @@ fn parse_options(
             }
             "--help" | "-h" => {
                 return Err(
-                    "Usage: minecraft-plus-wayland [--lock] [--module <n>]\n\n--module 0 selects Web module=0 (load cube); --module 6 selects module=6 (panorama); --module 8 selects module=8 (squid)."
+                    "Usage: minecraft-plus-wayland [--lock] [--module <n>]\n\n--module 0 selects Web module=0 (load cube); --module 6 selects module=6 (panorama); --module 8 selects module=8 (squid); --module 12 selects module=12 (creeper)."
                         .into(),
                 );
             }

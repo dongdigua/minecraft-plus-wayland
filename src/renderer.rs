@@ -118,6 +118,17 @@ impl Renderer {
             config.present_mode = wgpu::PresentMode::Fifo;
         }
         config.desired_maximum_frame_latency = 1;
+        // A layer-shell/session-lock render target is the complete wallpaper,
+        // not a translucent overlay. In particular, module=12 deliberately
+        // writes `scale^4` to fragment alpha just as the WebGL shader does;
+        // letting the Wayland compositor consume that alpha makes the desktop
+        // show through and applies an unintended second visual modulation.
+        if capabilities
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::Opaque)
+        {
+            config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
+        }
         self.surface.configure(&self.device, &config);
         self.config = Some(config);
         Ok(())
