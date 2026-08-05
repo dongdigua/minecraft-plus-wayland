@@ -42,6 +42,7 @@ pub struct AlphaFluidsModule {
     runtime_texels: Option<([u8; TEXTURE_BYTES], [u8; TEXTURE_BYTES])>,
     last_tick: Option<u64>,
     textures_dirty: bool,
+    fault: Option<String>,
 }
 
 impl AlphaFluidsModule {
@@ -58,7 +59,24 @@ impl AlphaFluidsModule {
             runtime_texels: None,
             last_tick: None,
             textures_dirty: false,
+            fault: None,
         }
+    }
+
+    fn record_fault(&mut self, stage: &str, error: impl std::fmt::Display) {
+        if self.fault.is_some() {
+            return;
+        }
+        let message = format!("alpha-fluid WASM {stage} fault: {error}");
+        log::error!(
+            target: "minecraft_plus_wayland::wasm",
+            "{message}; disabling the runtime and rendering black",
+        );
+        self.fault = Some(message);
+        self.water_runtime = None;
+        self.lava_runtime = None;
+        self.runtime_texels = None;
+        self.textures_dirty = false;
     }
 
     fn upload_textures(&mut self, context: &RenderContext<'_>) {
@@ -211,15 +229,19 @@ impl Module for AlphaFluidsModule {
             self.variant,
         );
         match self.variant {
-            AlphaFluidVariant::Water => {
-                self.water_runtime = Some(OriginalWaterRuntime::new()?);
-            }
-            AlphaFluidVariant::Lava => {
-                self.lava_runtime = Some(OriginalLavaRuntime::new()?);
-            }
+            AlphaFluidVariant::Water => match OriginalWaterRuntime::new() {
+                Ok(runtime) => self.water_runtime = Some(runtime),
+                Err(error) => self.record_fault("initialization", error),
+            },
+            AlphaFluidVariant::Lava => match OriginalLavaRuntime::new() {
+                Ok(runtime) => self.lava_runtime = Some(runtime),
+                Err(error) => self.record_fault("initialization", error),
+            },
         }
         // The first frame's update performs the first and only initial WASM
         // step. No synthetic raster is uploaded while runtime_texels is None.
+        // Runtime initialization failure is a fail-closed black frame rather
+        // than an error that can tear down a session-lock surface.
         Ok(())
     }
 
@@ -228,6 +250,9 @@ impl Module for AlphaFluidsModule {
     }
 
     fn update(&mut self, frame: FrameInfo) {
+        if self.fault.is_some() {
+            return;
+        }
         let tick = (frame.elapsed.as_secs_f32().max(0.0) / TICK_SECONDS).floor() as u64;
         if !advance_observed_bucket(&mut self.last_tick, tick) {
             return;
@@ -241,22 +266,25 @@ impl Module for AlphaFluidsModule {
             "stepping alpha-fluid WASM runtime: variant={:?}, observed_bucket={tick}",
             self.variant,
         );
-        let texels = match self.variant {
+        let result: Result<_, Box<dyn Error>> = match self.variant {
             AlphaFluidVariant::Water => self
                 .water_runtime
                 .as_mut()
-                .expect("Water runtime was not initialized")
-                .tick()
-                .expect("original Web water step failed before producing textures"),
+                .ok_or_else(|| -> Box<dyn Error> { "Water runtime was not initialized".into() })
+                .and_then(OriginalWaterRuntime::tick),
             AlphaFluidVariant::Lava => self
                 .lava_runtime
                 .as_mut()
-                .expect("Lava runtime was not initialized")
-                .tick()
-                .expect("original Web lava step failed before producing textures"),
+                .ok_or_else(|| -> Box<dyn Error> { "Lava runtime was not initialized".into() })
+                .and_then(OriginalLavaRuntime::tick),
         };
-        self.runtime_texels = Some(texels);
-        self.textures_dirty = true;
+        match result {
+            Ok(texels) => {
+                self.runtime_texels = Some(texels);
+                self.textures_dirty = true;
+            }
+            Err(error) => self.record_fault("step", error),
+        }
     }
 
     fn wants_continuous_frames(&self) -> bool {
@@ -270,6 +298,25 @@ impl Module for AlphaFluidsModule {
         target: &wgpu::TextureView,
         frame: FrameInfo,
     ) {
+        if self.fault.is_some() {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("alpha-fluids fault black frame"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            return;
+        }
         if self.textures_dirty {
             self.upload_textures(context);
         }
@@ -573,7 +620,10 @@ fn fs_unorm(input: VertexOutput) -> @location(0) vec4<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GRID_SIZE, RenderSize, advance_observed_bucket, alpha_fluids_mvp, matrix_bytes};
+    use super::{
+        AlphaFluidVariant, AlphaFluidsModule, GRID_SIZE, RenderSize, advance_observed_bucket,
+        alpha_fluids_mvp, matrix_bytes,
+    };
 
     #[test]
     fn observed_buckets_step_once_without_catching_up() {
@@ -586,6 +636,26 @@ mod tests {
 
         assert_eq!(steps, 4);
         assert_eq!(last_tick, Some(75_000));
+    }
+
+    #[test]
+    fn wasm_fault_disables_runtime_state_without_panicking() {
+        let mut module = AlphaFluidsModule::new(AlphaFluidVariant::Water);
+        module.record_fault("test", "injected trap");
+        assert!(
+            module
+                .fault
+                .as_deref()
+                .is_some_and(|message| message.contains("injected trap"))
+        );
+        assert!(module.water_runtime.is_none());
+        assert!(module.lava_runtime.is_none());
+        assert!(module.runtime_texels.is_none());
+        assert!(!module.textures_dirty);
+
+        let first_fault = module.fault.clone();
+        module.record_fault("second test", "must not replace first fault");
+        assert_eq!(module.fault, first_fault);
     }
 
     #[test]

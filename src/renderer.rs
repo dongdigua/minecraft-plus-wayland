@@ -113,6 +113,20 @@ impl Renderer {
             .ok_or("the selected adapter does not support the layer surface")?;
         config.format = preferred_surface_format(&capabilities.formats)
             .ok_or("the selected adapter reports no supported surface formats")?;
+        #[cfg(debug_assertions)]
+        if let Some(value) = std::env::var_os("MINECRAFT_PLUS_SURFACE_FORMAT") {
+            let value = value
+                .into_string()
+                .map_err(|_| "MINECRAFT_PLUS_SURFACE_FORMAT is not valid UTF-8")?;
+            config.format = debug_surface_format_override(&value, &capabilities.formats)
+                .map_err(|error| format!("invalid MINECRAFT_PLUS_SURFACE_FORMAT: {error}"))?;
+            log::warn!(
+                target: "minecraft_plus_wayland::surface",
+                "using debug-only surface format override: value={value:?}, format={:?}, is_srgb={}",
+                config.format,
+                config.format.is_srgb(),
+            );
+        }
         if capabilities
             .present_modes
             .contains(&wgpu::PresentMode::Fifo)
@@ -241,9 +255,38 @@ fn preferred_surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::Tex
         .or_else(|| formats.first().copied())
 }
 
+#[cfg(any(debug_assertions, test))]
+fn debug_surface_format_override(
+    value: &str,
+    supported: &[wgpu::TextureFormat],
+) -> Result<wgpu::TextureFormat, String> {
+    let format = match value.to_ascii_lowercase().as_str() {
+        "rgba8unorm" | "rgba8-unorm" => wgpu::TextureFormat::Rgba8Unorm,
+        "bgra8unorm" | "bgra8-unorm" => wgpu::TextureFormat::Bgra8Unorm,
+        "rgba8unormsrgb" | "rgba8unorm-srgb" | "rgba8-unorm-srgb" => {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        }
+        "bgra8unormsrgb" | "bgra8unorm-srgb" | "bgra8-unorm-srgb" => {
+            wgpu::TextureFormat::Bgra8UnormSrgb
+        }
+        _ => {
+            return Err(format!(
+                "unsupported value {value:?}; expected rgba8unorm, bgra8unorm, \
+                 rgba8unorm-srgb, or bgra8unorm-srgb"
+            ));
+        }
+    };
+    if !supported.contains(&format) {
+        return Err(format!(
+            "requested format {format:?} is unavailable; compositor supports {supported:?}"
+        ));
+    }
+    Ok(format)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::preferred_surface_format;
+    use super::{debug_surface_format_override, preferred_surface_format};
 
     #[test]
     fn surface_format_prefers_srgb_over_capability_order() {
@@ -267,5 +310,19 @@ mod tests {
             Some(wgpu::TextureFormat::Rgba8Unorm)
         );
         assert_eq!(preferred_surface_format(&[]), None);
+    }
+
+    #[test]
+    fn debug_override_accepts_only_supported_unorm_surface_formats() {
+        let supported = [
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ];
+        assert_eq!(
+            debug_surface_format_override("rgba8unorm", &supported).unwrap(),
+            wgpu::TextureFormat::Rgba8Unorm
+        );
+        assert!(debug_surface_format_override("bgra8unorm", &supported).is_err());
+        assert!(debug_surface_format_override("rgba16float", &supported).is_err());
     }
 }
