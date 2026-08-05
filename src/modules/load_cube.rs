@@ -3,9 +3,10 @@ use std::error::Error;
 use rand::{RngCore, SeedableRng};
 use rand_hc::Hc128Rng;
 
-use super::{FrameInfo, Module, RenderContext, RenderSize};
+use super::{FrameInfo, Module, RenderContext, RenderSize, web_surface_fragment_entry};
 
 const ATLAS_RESOURCE: &str = "full_blocks.png";
+const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const BLOCK_LIST_RESOURCE: &str = "full_blocks.txt";
 const VISIBLE_FACE_COUNT: usize = 5;
 const STORED_OFFSET_COUNT: usize = 6;
@@ -68,7 +69,9 @@ impl Module for LoadCubeModule {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            // WebGL samples the decoded atlas bytes as numeric values, with no
+            // sRGB decode at the texture boundary.
+            format: ATLAS_FORMAT,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -187,7 +190,11 @@ impl Module for LoadCubeModule {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(web_surface_fragment_entry(
+                        context.surface_format,
+                        "fs_srgb",
+                        "fs_unorm",
+                    )),
                     compilation_options: Default::default(),
                     targets: &[Some(context.surface_format.into())],
                 }),
@@ -568,11 +575,35 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn srgb_to_linear(channel: f32) -> f32 {
+    if (channel <= 0.04045) {
+        return channel / 12.92;
+    }
+    return pow((channel + 0.055) / 1.055, 2.4);
+}
+
+fn web_color(input: VertexOutput) -> vec4<f32> {
     let slot = uniforms.slot_offsets[input.slot].xy;
     let tex = (slot + vec2<f32>(1.0 - input.tex.x, 1.0 - input.tex.y)) / uniforms.atlas_width;
     return textureSample(block_atlas, block_sampler, tex);
+}
+
+@fragment
+fn fs_srgb(input: VertexOutput) -> @location(0) vec4<f32> {
+    let color = web_color(input);
+    return vec4<f32>(
+        vec3<f32>(
+            srgb_to_linear(color.r),
+            srgb_to_linear(color.g),
+            srgb_to_linear(color.b),
+        ),
+        color.a,
+    );
+}
+
+@fragment
+fn fs_unorm(input: VertexOutput) -> @location(0) vec4<f32> {
+    return web_color(input);
 }
 "#;
 

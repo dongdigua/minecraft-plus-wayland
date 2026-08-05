@@ -2,7 +2,7 @@ use std::error::Error;
 
 use rand::Rng;
 
-use super::{FrameInfo, Module, RenderContext, RenderSize};
+use super::{FrameInfo, Module, RenderContext, RenderSize, web_surface_fragment_entry};
 
 const FOOTPRINT_RESOURCE: &str = "footprint.png";
 const FOOTPRINT_DIMENSION: u32 = 8;
@@ -11,7 +11,9 @@ const WALKER_COUNT: usize = 4;
 const MAX_FOOTPRINTS: usize = 64;
 const FOOTPRINT_BYTES: u64 = 32;
 const GLOBAL_BYTES: u64 = 16;
+const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const CHOOSE_RUN_ATTEMPTS: usize = 256;
 
 /// Native wgpu implementation of Web module=7 (`footprint`).
 ///
@@ -21,10 +23,13 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 #[derive(Default)]
 pub struct FootprintModule {
     pipeline: Option<wgpu::RenderPipeline>,
+    composite_pipeline: Option<wgpu::RenderPipeline>,
     bind_group: Option<wgpu::BindGroup>,
+    composite_layout: Option<wgpu::BindGroupLayout>,
+    composite_bind_group: Option<wgpu::BindGroup>,
     globals: Option<wgpu::Buffer>,
     footprints: Option<wgpu::Buffer>,
-    depth: Option<DepthTarget>,
+    render_target: Option<FootprintTarget>,
     state: FootprintState,
 }
 
@@ -125,6 +130,30 @@ impl Module for FootprintModule {
                     bind_group_layouts: &[Some(&layout)],
                     immediate_size: 0,
                 });
+        let composite_layout =
+            context
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("footprint composite bind group layout"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        },
+                        count: None,
+                    }],
+                });
+        let composite_pipeline_layout =
+            context
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("footprint composite pipeline layout"),
+                    bind_group_layouts: &[Some(&composite_layout)],
+                    immediate_size: 0,
+                });
         let shader = context
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -183,7 +212,10 @@ impl Module for FootprintModule {
                     entry_point: Some("fs_main"),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: context.surface_format,
+                        // Blend exactly in the WebGL numeric color domain.
+                        // Conversion for an sRGB presentation surface happens
+                        // only after this pass has finished.
+                        format: COLOR_FORMAT,
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -214,15 +246,66 @@ impl Module for FootprintModule {
                 cache: None,
             },
         ));
+        self.composite_pipeline = Some(context.device.create_render_pipeline(
+            &wgpu::RenderPipelineDescriptor {
+                label: Some("footprint composite pipeline"),
+                layout: Some(&composite_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_composite"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(web_surface_fragment_entry(
+                        context.surface_format,
+                        "fs_composite_srgb",
+                        "fs_composite_unorm",
+                    )),
+                    compilation_options: Default::default(),
+                    targets: &[Some(context.surface_format.into())],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            },
+        ));
         self.globals = Some(globals);
         self.footprints = Some(footprints);
         self.bind_group = Some(bind_group);
+        self.composite_layout = Some(composite_layout);
         Ok(())
     }
 
     fn resize(&mut self, context: &RenderContext<'_>, size: RenderSize) {
         self.state.set_viewport(size);
-        self.depth = Some(DepthTarget::new(context.device, size));
+        let render_target = FootprintTarget::new(context.device, size);
+        let composite_layout = self
+            .composite_layout
+            .as_ref()
+            .expect("FootprintModule was not initialized");
+        self.composite_bind_group = Some(context.device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                label: Some("footprint composite bind group"),
+                layout: composite_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&render_target.color_view),
+                }],
+            },
+        ));
+        self.render_target = Some(render_target);
     }
 
     fn update(&mut self, frame: FrameInfo) {
@@ -256,8 +339,16 @@ impl Module for FootprintModule {
             .footprints
             .as_ref()
             .expect("FootprintModule was not initialized");
-        let depth = self
-            .depth
+        let render_target = self
+            .render_target
+            .as_ref()
+            .expect("FootprintModule was not resized");
+        let composite_pipeline = self
+            .composite_pipeline
+            .as_ref()
+            .expect("FootprintModule was not initialized");
+        let composite_bind_group = self
+            .composite_bind_group
             .as_ref()
             .expect("FootprintModule was not resized");
 
@@ -277,8 +368,37 @@ impl Module for FootprintModule {
             .queue
             .write_buffer(footprints, 0, &footprint_bytes(&self.state.footprints));
 
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("footprint Web numeric color pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &render_target.color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &render_target.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.draw(0..6, 0..self.state.footprints.len() as u32);
+        }
+
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("footprint module"),
+            label: Some("footprint composite pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 depth_slice: None,
@@ -288,21 +408,14 @@ impl Module for FootprintModule {
                     store: wgpu::StoreOp::Store,
                 },
             })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &depth.view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Discard,
-                }),
-                stencil_ops: None,
-            }),
+            depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.draw(0..6, 0..self.state.footprints.len() as u32);
+        pass.set_pipeline(composite_pipeline);
+        pass.set_bind_group(0, composite_bind_group, &[]);
+        pass.draw(0..6, 0..1);
     }
 }
 
@@ -385,6 +498,25 @@ impl Walker {
 impl FootprintState {
     fn set_viewport(&mut self, viewport: RenderSize) {
         self.viewport = viewport;
+        let bounds = Bounds::for_viewport(viewport);
+        for walker in &mut self.walkers {
+            let phase_fits = match &walker.phase {
+                WalkerPhase::Paused { .. } => true,
+                WalkerPhase::Moving {
+                    origin,
+                    direction,
+                    duration,
+                    ..
+                } => {
+                    bounds.contains_strictly(*origin)
+                        && bounds.contains_strictly(run_endpoint(*origin, *direction, *duration))
+                }
+            };
+            if !bounds.contains_strictly(walker.position) || !phase_fits {
+                walker.position = bounds.clamp_strictly(walker.position);
+                walker.phase = WalkerPhase::Paused { remaining: 0 };
+            }
+        }
     }
 
     fn advance(&mut self, elapsed_seconds: f64) {
@@ -436,6 +568,15 @@ impl Bounds {
             && self.min_y < point[1]
             && point[1] < self.max_y
     }
+
+    fn clamp_strictly(self, point: [f32; 2]) -> [f32; 2] {
+        let inset_x = (self.max_x - self.min_x) * 0.001;
+        let inset_y = (self.max_y - self.min_y) * 0.001;
+        [
+            point[0].clamp(self.min_x + inset_x, self.max_x - inset_x),
+            point[1].clamp(self.min_y + inset_y, self.max_y - inset_y),
+        ]
+    }
 }
 
 fn advance_walker(walker: &mut Walker, bounds: Bounds, rng: &mut impl Rng) {
@@ -486,16 +627,12 @@ fn advance_walker(walker: &mut Walker, bounds: Bounds, rng: &mut impl Rng) {
 }
 
 fn choose_run(position: [f32; 2], bounds: Bounds, rng: &mut impl Rng) -> WalkerPhase {
-    loop {
+    for _ in 0..CHOOSE_RUN_ATTEMPTS {
         let rotation_degrees = rng.gen_range(0.0_f32, 360.0_f32);
         let radians = rotation_degrees.to_radians();
         let direction = [radians.cos(), radians.sin()];
         let duration = rng.gen_range(100_u64, 300_u64);
-        let endpoint = [
-            position[0] + direction[0] * duration as f32 / 7.0,
-            position[1] + direction[1] * duration as f32 / 7.0,
-        ];
-        if bounds.contains_strictly(endpoint) {
+        if bounds.contains_strictly(run_endpoint(position, direction, duration)) {
             return WalkerPhase::Moving {
                 origin: position,
                 direction,
@@ -505,6 +642,40 @@ fn choose_run(position: [f32; 2], bounds: Bounds, rng: &mut impl Rng) -> WalkerP
             };
         }
     }
+
+    // A viewport can be too small for any Web-length run. Keep the Web
+    // duration while deterministically scaling the direction toward an
+    // interior target instead of retrying forever. A centered walker targets
+    // a fixed point halfway toward +X so the fallback always moves.
+    let duration = 100;
+    let center = [
+        (bounds.min_x + bounds.max_x) * 0.5,
+        (bounds.min_y + bounds.max_y) * 0.5,
+    ];
+    let target = if position == center {
+        [center[0] + (bounds.max_x - center[0]) * 0.5, center[1]]
+    } else {
+        center
+    };
+    let direction = [
+        (target[0] - position[0]) * 7.0 / duration as f32,
+        (target[1] - position[1]) * 7.0 / duration as f32,
+    ];
+    let rotation_degrees = direction[1].atan2(direction[0]).to_degrees();
+    WalkerPhase::Moving {
+        origin: position,
+        direction,
+        progress: 0,
+        duration,
+        rotation_degrees,
+    }
+}
+
+fn run_endpoint(origin: [f32; 2], direction: [f32; 2], duration: u64) -> [f32; 2] {
+    [
+        origin[0] + direction[0] * duration as f32 / 7.0,
+        origin[1] + direction[1] * duration as f32 / 7.0,
+    ]
 }
 
 fn make_footprint(walker: &Walker, birth_tick: u64) -> Footprint {
@@ -522,20 +693,34 @@ fn make_footprint(walker: &Walker, birth_tick: u64) -> Footprint {
     }
 }
 
-struct DepthTarget {
-    _texture: wgpu::Texture,
-    view: wgpu::TextureView,
+struct FootprintTarget {
+    _color: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    _depth: wgpu::Texture,
+    depth_view: wgpu::TextureView,
 }
 
-impl DepthTarget {
+impl FootprintTarget {
     fn new(device: &wgpu::Device, size: RenderSize) -> Self {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
+        let extent = wgpu::Extent3d {
+            width: size.width.max(1),
+            height: size.height.max(1),
+            depth_or_array_layers: 1,
+        };
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("footprint Web numeric color texture"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COLOR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("footprint depth texture"),
-            size: wgpu::Extent3d {
-                width: size.width.max(1),
-                height: size.height.max(1),
-                depth_or_array_layers: 1,
-            },
+            size: extent,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -543,10 +728,12 @@ impl DepthTarget {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
         Self {
-            _texture: texture,
-            view,
+            _color: color,
+            color_view,
+            _depth: depth,
+            depth_view,
         }
     }
 }
@@ -664,8 +851,26 @@ fn vs_main(
     return output;
 }
 
-// The WebGL canvas presents shader numeric RGB as sRGB; this Wayland target
-// may be sRGB, so provide linear RGB for its encoding step.
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    if (input.alpha == 0.0) {
+        discard;
+    }
+    let sampled = textureSample(footprint_texture, footprint_sampler, input.tex);
+    return vec4<f32>(sampled.rgb * input.color, sampled.a * input.alpha);
+}
+
+@group(0) @binding(4) var composited_footprints: texture_2d<f32>;
+
+@vertex
+fn vs_composite(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
+    let positions = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
+        vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0),
+    );
+    return vec4<f32>(positions[vertex_index], 0.0, 1.0);
+}
+
 fn srgb_to_linear(channel: f32) -> f32 {
     if (channel <= 0.04045) {
         return channel / 12.92;
@@ -674,19 +879,156 @@ fn srgb_to_linear(channel: f32) -> f32 {
 }
 
 @fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    if (input.alpha == 0.0) {
-        discard;
-    }
-    let sampled = textureSample(footprint_texture, footprint_sampler, input.tex);
-    let webgl_rgb = sampled.rgb * input.color;
+fn fs_composite_srgb(
+    @builtin(position) position: vec4<f32>,
+) -> @location(0) vec4<f32> {
+    let webgl_color = textureLoad(composited_footprints, vec2<i32>(position.xy), 0);
     return vec4<f32>(
-        vec3<f32>(
-            srgb_to_linear(webgl_rgb.r),
-            srgb_to_linear(webgl_rgb.g),
-            srgb_to_linear(webgl_rgb.b),
-        ),
-        sampled.a * input.alpha,
+        srgb_to_linear(webgl_color.r),
+        srgb_to_linear(webgl_color.g),
+        srgb_to_linear(webgl_color.b),
+        1.0,
     );
 }
+
+@fragment
+fn fs_composite_unorm(
+    @builtin(position) position: vec4<f32>,
+) -> @location(0) vec4<f32> {
+    let webgl_color = textureLoad(composited_footprints, vec2<i32>(position.xy), 0);
+    return vec4<f32>(webgl_color.rgb, 1.0);
+}
 "#;
+
+#[cfg(test)]
+mod tests {
+    use rand::SeedableRng;
+    use rand_hc::Hc128Rng;
+
+    use super::{
+        Bounds, COLOR_FORMAT, FootprintState, RenderSize, WalkerPhase, choose_run, run_endpoint,
+    };
+
+    #[test]
+    fn footprints_blend_into_a_web_numeric_unorm_target() {
+        assert_eq!(COLOR_FORMAT, wgpu::TextureFormat::Rgba8Unorm);
+    }
+
+    #[test]
+    fn shrinking_a_large_viewport_rehomes_walkers_and_invalidates_old_runs() {
+        let mut state = FootprintState::default();
+        state.set_viewport(RenderSize {
+            width: 4_000,
+            height: 3_000,
+        });
+        state.walkers[0].position = [100.0, 50.0];
+        state.walkers[0].phase = WalkerPhase::Moving {
+            origin: [100.0, 50.0],
+            direction: [1.0, 0.0],
+            progress: 10,
+            duration: 100,
+            rotation_degrees: 0.0,
+        };
+
+        let small = RenderSize {
+            width: 100,
+            height: 80,
+        };
+        state.set_viewport(small);
+        let bounds = Bounds::for_viewport(small);
+        for walker in &state.walkers {
+            assert!(bounds.contains_strictly(walker.position));
+            if let WalkerPhase::Moving {
+                origin,
+                direction,
+                duration,
+                ..
+            } = walker.phase
+            {
+                assert!(bounds.contains_strictly(run_endpoint(origin, direction, duration)));
+            }
+        }
+        assert!(matches!(
+            state.walkers[0].phase,
+            WalkerPhase::Paused { remaining: 0 }
+        ));
+    }
+
+    #[test]
+    fn tiny_viewport_run_selection_is_finite_and_has_a_feasible_fallback() {
+        let bounds = Bounds::for_viewport(RenderSize {
+            width: 1,
+            height: 1,
+        });
+        let position = [bounds.max_x * 0.9, bounds.max_y * 0.9];
+        let mut rng = Hc128Rng::from_seed([0x33; 32]);
+        let phase = choose_run(position, bounds, &mut rng);
+        let WalkerPhase::Moving {
+            origin,
+            direction,
+            duration,
+            ..
+        } = phase
+        else {
+            panic!("choose_run must produce a bounded moving fallback");
+        };
+        assert_eq!(duration, 100);
+        assert!(bounds.contains_strictly(run_endpoint(origin, direction, duration)));
+    }
+
+    #[test]
+    fn centered_tiny_viewport_fallback_has_nonzero_direction_and_strict_endpoint() {
+        let bounds = Bounds::for_viewport(RenderSize {
+            width: 1,
+            height: 1,
+        });
+        let center = [
+            (bounds.min_x + bounds.max_x) * 0.5,
+            (bounds.min_y + bounds.max_y) * 0.5,
+        ];
+        let mut first_rng = Hc128Rng::from_seed([0x44; 32]);
+        let mut second_rng = Hc128Rng::from_seed([0x44; 32]);
+        let first = choose_run(center, bounds, &mut first_rng);
+        let second = choose_run(center, bounds, &mut second_rng);
+        let WalkerPhase::Moving {
+            origin,
+            direction,
+            duration,
+            ..
+        } = first
+        else {
+            panic!("choose_run must produce a bounded moving fallback");
+        };
+        let WalkerPhase::Moving {
+            direction: second_direction,
+            ..
+        } = second
+        else {
+            panic!("choose_run must deterministically produce a moving fallback");
+        };
+
+        assert_eq!(direction, second_direction);
+        assert_ne!(direction, [0.0, 0.0]);
+        assert!(bounds.contains_strictly(run_endpoint(origin, direction, duration)));
+    }
+
+    #[test]
+    fn repeated_tiny_viewport_updates_keep_every_walker_bounded() {
+        let mut state = FootprintState::default();
+        let viewport = RenderSize {
+            width: 1,
+            height: 1,
+        };
+        state.set_viewport(viewport);
+        let bounds = Bounds::for_viewport(viewport);
+        for tick in 1..=500 {
+            state.advance(tick as f64 * 0.05);
+            assert!(
+                state
+                    .walkers
+                    .iter()
+                    .all(|walker| bounds.contains_strictly(walker.position))
+            );
+        }
+    }
+}

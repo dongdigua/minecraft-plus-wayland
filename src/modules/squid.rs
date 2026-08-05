@@ -2,7 +2,7 @@ use std::error::Error;
 
 use rand::Rng;
 
-use super::{FrameInfo, Module, RenderContext};
+use super::{FrameInfo, Module, RenderContext, web_surface_fragment_entry};
 
 const SQUID_ATLAS_WIDTH: u32 = 128;
 const SQUID_ATLAS_HEIGHT: u32 = 640;
@@ -102,7 +102,8 @@ impl Module for SquidModule {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            // WebGL samples the decoded PNG bytes as numeric RGBA values.
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -170,7 +171,11 @@ impl Module for SquidModule {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(web_surface_fragment_entry(
+                        context.surface_format,
+                        "fs_srgb",
+                        "fs_unorm",
+                    )),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: context.surface_format,
@@ -353,9 +358,36 @@ fn vs_main(
     return output;
 }
 
+fn srgb_to_linear(channel: f32) -> f32 {
+    if (channel <= 0.04045) {
+        return channel / 12.92;
+    }
+    return pow((channel + 0.055) / 1.055, 2.4);
+}
+
 @fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(squid_atlas, squid_sampler, input.uv);
+fn fs_srgb(input: VertexOutput) -> @location(0) vec4<f32> {
+    let color = textureSample(squid_atlas, squid_sampler, input.uv);
+    if (color.a == 0.0) {
+        discard;
+    }
+    return vec4<f32>(
+        vec3<f32>(
+            srgb_to_linear(color.r),
+            srgb_to_linear(color.g),
+            srgb_to_linear(color.b),
+        ),
+        color.a,
+    );
+}
+
+@fragment
+fn fs_unorm(input: VertexOutput) -> @location(0) vec4<f32> {
+    let color = textureSample(squid_atlas, squid_sampler, input.uv);
+    if (color.a == 0.0) {
+        discard;
+    }
+    return color;
 }
 "#;
 

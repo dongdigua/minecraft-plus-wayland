@@ -1,12 +1,13 @@
 use std::{error::Error, time::Duration};
 
-use rand::Rng;
+use rand::{Rng, distributions::StandardNormal};
 
-use super::{FrameInfo, Module, RenderContext, RenderSize};
+use super::{FrameInfo, Module, RenderContext, RenderSize, web_surface_fragment_entry};
 
 const BLOCK_LIST_RESOURCE: &str = "full_blocks.txt";
 const BLOCK_TEXTURE_RESOURCE: &str = "full_blocks.png";
 const ATLAS_DIMENSION: u32 = 512;
+const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const TILE_DIMENSION: u32 = 16;
 const BLOCK_HALF_SIZE: f32 = 128.0;
 const TICK_SECONDS: f64 = 0.05;
@@ -35,45 +36,70 @@ pub enum DvdBounceVariant {
 /// instead renders the fractional position directly to the Wayland target.
 pub struct DvdBounceModule {
     variant: DvdBounceVariant,
-    direct_pipeline: Option<wgpu::RenderPipeline>,
-    trail_pipeline: Option<wgpu::RenderPipeline>,
-    copy_pipeline: Option<wgpu::RenderPipeline>,
+    resources: Option<VariantResources>,
     block_bind_group: Option<wgpu::BindGroup>,
-    copy_bind_group_layout: Option<wgpu::BindGroupLayout>,
-    copy_bind_group: Option<wgpu::BindGroup>,
     uniforms: Option<wgpu::Buffer>,
-    trail: Option<TrailTarget>,
     slot_count: usize,
     state: BounceState,
+}
+
+struct DirectResources {
+    pipeline: wgpu::RenderPipeline,
+}
+
+struct TrailResources {
+    trail_pipeline: wgpu::RenderPipeline,
+    copy_pipeline: wgpu::RenderPipeline,
+    copy_bind_group_layout: wgpu::BindGroupLayout,
+    surface: Option<TrailSurfaceResources>,
+    smooth_front_pipeline: Option<wgpu::RenderPipeline>,
+}
+
+enum VariantResources {
+    Direct(DirectResources),
+    Trail(Box<TrailResources>),
+}
+
+struct TrailSurfaceResources {
+    target: TrailTarget,
+    copy_bind_group: wgpu::BindGroup,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResourceNeeds {
+    direct_pipeline: bool,
+    trail_pipeline: bool,
+    trail_texture: bool,
+    trail_copy_resources: bool,
+}
+
+fn resource_needs(variant: DvdBounceVariant, smooth_trail_front: bool) -> ResourceNeeds {
+    match variant {
+        DvdBounceVariant::Direct => ResourceNeeds {
+            direct_pipeline: true,
+            trail_pipeline: false,
+            trail_texture: false,
+            trail_copy_resources: false,
+        },
+        DvdBounceVariant::Trail => ResourceNeeds {
+            direct_pipeline: smooth_trail_front,
+            trail_pipeline: true,
+            trail_texture: true,
+            trail_copy_resources: true,
+        },
+    }
 }
 
 impl DvdBounceModule {
     pub fn new(variant: DvdBounceVariant) -> Self {
         let mut random = rand::thread_rng();
-        let velocity = loop {
-            // The Web binary supplies random signed integer velocities. Its
-            // rand helper is fully inlined, so it does not expose a stable
-            // source-level range; this symmetric native range covers the
-            // observed Web samples while retaining non-zero motion.
-            let candidate = [
-                random.gen_range(-25_i32, 26_i32),
-                random.gen_range(-25_i32, 26_i32),
-            ];
-            if candidate != [0, 0] {
-                break candidate;
-            }
-        };
+        let velocity = initial_velocity(&mut random);
 
         Self {
             variant,
-            direct_pipeline: None,
-            trail_pipeline: None,
-            copy_pipeline: None,
+            resources: None,
             block_bind_group: None,
-            copy_bind_group_layout: None,
-            copy_bind_group: None,
             uniforms: None,
-            trail: None,
             slot_count: 0,
             state: BounceState {
                 position: [0, 0],
@@ -115,7 +141,7 @@ impl Module for DvdBounceModule {
             dimension: wgpu::TextureDimension::D2,
             // The WebGL upload uses RGB bytes without sRGB decode. The image
             // crate expands those bytes to opaque RGBA while preserving RGB.
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: ATLAS_FORMAT,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -156,27 +182,12 @@ impl Module for DvdBounceModule {
                         sampler_binding(2),
                     ],
                 });
-        let copy_layout =
-            context
-                .device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("dvd-bounce copy bind group layout"),
-                    entries: &[texture_binding(3), sampler_binding(4)],
-                });
         let block_pipeline_layout =
             context
                 .device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("dvd-bounce block pipeline layout"),
                     bind_group_layouts: &[Some(&block_layout)],
-                    immediate_size: 0,
-                });
-        let copy_pipeline_layout =
-            context
-                .device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("dvd-bounce copy pipeline layout"),
-                    bind_group_layouts: &[Some(&copy_layout)],
                     immediate_size: 0,
                 });
         let shader = context
@@ -212,85 +223,147 @@ impl Module for DvdBounceModule {
                 ],
             });
 
-        self.direct_pipeline = Some(create_block_pipeline(
-            context.device,
-            &shader,
-            &block_pipeline_layout,
-            context.surface_format,
-            "dvd-bounce direct pipeline",
-            "fs_direct",
-        ));
-        self.trail_pipeline = Some(create_block_pipeline(
-            context.device,
-            &shader,
-            &block_pipeline_layout,
-            wgpu::TextureFormat::Rgba8Unorm,
-            "dvd-bounce trail pipeline",
-            "fs_trail",
-        ));
-        self.copy_pipeline = Some(context.device.create_render_pipeline(
-            &wgpu::RenderPipelineDescriptor {
-                label: Some("dvd-bounce copy pipeline"),
-                layout: Some(&copy_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_copy"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_copy"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(context.surface_format.into())],
-                }),
-                primitive: ccw_backface_primitive(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            },
-        ));
+        let needs = resource_needs(self.variant, SMOOTH_TRAIL_FRONT);
+        self.resources = Some(match self.variant {
+            DvdBounceVariant::Direct => {
+                debug_assert!(needs.direct_pipeline);
+                VariantResources::Direct(DirectResources {
+                    pipeline: create_block_pipeline(
+                        context.device,
+                        &shader,
+                        &block_pipeline_layout,
+                        context.surface_format,
+                        "dvd-bounce direct pipeline",
+                        web_surface_fragment_entry(
+                            context.surface_format,
+                            "fs_direct_srgb",
+                            "fs_direct_unorm",
+                        ),
+                    ),
+                })
+            }
+            DvdBounceVariant::Trail => {
+                debug_assert!(
+                    needs.trail_pipeline && needs.trail_texture && needs.trail_copy_resources
+                );
+                let copy_bind_group_layout =
+                    context
+                        .device
+                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                            label: Some("dvd-bounce copy bind group layout"),
+                            entries: &[texture_binding(3), sampler_binding(4)],
+                        });
+                let copy_pipeline_layout =
+                    context
+                        .device
+                        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                            label: Some("dvd-bounce copy pipeline layout"),
+                            bind_group_layouts: &[Some(&copy_bind_group_layout)],
+                            immediate_size: 0,
+                        });
+                let trail_pipeline = create_block_pipeline(
+                    context.device,
+                    &shader,
+                    &block_pipeline_layout,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                    "dvd-bounce trail pipeline",
+                    "fs_trail",
+                );
+                let copy_pipeline =
+                    context
+                        .device
+                        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                            label: Some("dvd-bounce copy pipeline"),
+                            layout: Some(&copy_pipeline_layout),
+                            vertex: wgpu::VertexState {
+                                module: &shader,
+                                entry_point: Some("vs_copy"),
+                                buffers: &[],
+                                compilation_options: Default::default(),
+                            },
+                            fragment: Some(wgpu::FragmentState {
+                                module: &shader,
+                                entry_point: Some(web_surface_fragment_entry(
+                                    context.surface_format,
+                                    "fs_copy_srgb",
+                                    "fs_copy_unorm",
+                                )),
+                                compilation_options: Default::default(),
+                                targets: &[Some(context.surface_format.into())],
+                            }),
+                            primitive: ccw_backface_primitive(),
+                            depth_stencil: None,
+                            multisample: wgpu::MultisampleState::default(),
+                            multiview_mask: None,
+                            cache: None,
+                        });
+                let smooth_front_pipeline = needs.direct_pipeline.then(|| {
+                    create_block_pipeline(
+                        context.device,
+                        &shader,
+                        &block_pipeline_layout,
+                        context.surface_format,
+                        "dvd-bounce smooth trail front pipeline",
+                        web_surface_fragment_entry(
+                            context.surface_format,
+                            "fs_direct_srgb",
+                            "fs_direct_unorm",
+                        ),
+                    )
+                });
+                VariantResources::Trail(Box::new(TrailResources {
+                    trail_pipeline,
+                    copy_pipeline,
+                    copy_bind_group_layout,
+                    surface: None,
+                    smooth_front_pipeline,
+                }))
+            }
+        });
         self.block_bind_group = Some(block_bind_group);
-        self.copy_bind_group_layout = Some(copy_layout);
         self.uniforms = Some(uniforms);
         Ok(())
     }
 
     fn resize(&mut self, context: &RenderContext<'_>, size: RenderSize) {
-        let trail = TrailTarget::new(context.device, size);
-        if self.variant == DvdBounceVariant::Trail {
-            let layout = self
-                .copy_bind_group_layout
-                .as_ref()
-                .expect("DvdBounceModule was not initialized");
-            let sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("dvd-bounce trail nearest sampler"),
-                address_mode_u: wgpu::AddressMode::ClampToEdge,
-                address_mode_v: wgpu::AddressMode::ClampToEdge,
-                mag_filter: wgpu::FilterMode::Nearest,
-                min_filter: wgpu::FilterMode::Nearest,
-                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-                ..Default::default()
+        let resources = self
+            .resources
+            .as_mut()
+            .expect("DvdBounceModule was not initialized");
+        let VariantResources::Trail(resources) = resources else {
+            return;
+        };
+
+        let target = TrailTarget::new(context.device, size);
+        let sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("dvd-bounce trail nearest sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let copy_bind_group = context
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dvd-bounce copy bind group"),
+                layout: &resources.copy_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&target.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
             });
-            self.copy_bind_group = Some(context.device.create_bind_group(
-                &wgpu::BindGroupDescriptor {
-                    label: Some("dvd-bounce copy bind group"),
-                    layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::TextureView(&trail.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::Sampler(&sampler),
-                        },
-                    ],
-                },
-            ));
-        }
-        self.trail = Some(trail);
+        resources.surface = Some(TrailSurfaceResources {
+            target,
+            copy_bind_group,
+        });
     }
 
     fn update(&mut self, frame: FrameInfo) {
@@ -344,9 +417,13 @@ impl Module for DvdBounceModule {
             .block_bind_group
             .as_ref()
             .expect("DvdBounceModule was not initialized");
+        let resources = self
+            .resources
+            .as_mut()
+            .expect("DvdBounceModule was not initialized");
 
-        match self.variant {
-            DvdBounceVariant::Direct => {
+        match resources {
+            VariantResources::Direct(resources) => {
                 let fraction = interpolation_fraction(frame.elapsed);
                 let center = [
                     self.state.position[0] as f32 + fraction * self.state.velocity[0] as f32,
@@ -357,10 +434,6 @@ impl Module for DvdBounceModule {
                     0,
                     &uniform_bytes(center, frame.size, self.state.slot_offset),
                 );
-                let pipeline = self
-                    .direct_pipeline
-                    .as_ref()
-                    .expect("DvdBounceModule was not initialized");
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("dvd-bounce direct pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -377,25 +450,20 @@ impl Module for DvdBounceModule {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                pass.set_pipeline(pipeline);
+                pass.set_pipeline(&resources.pipeline);
                 pass.set_bind_group(0, block_bind_group, &[]);
                 pass.draw(0..6, 0..1);
             }
-            DvdBounceVariant::Trail => {
-                if self
-                    .trail
-                    .as_ref()
-                    .expect("DvdBounceModule was not resized")
-                    .clear_pending
-                {
-                    let trail = self
-                        .trail
-                        .as_ref()
-                        .expect("DvdBounceModule was not resized");
+            VariantResources::Trail(resources) => {
+                let surface = resources
+                    .surface
+                    .as_mut()
+                    .expect("DvdBounceModule was not resized");
+                if surface.target.clear_pending {
                     let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("dvd-bounce initial trail clear"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &trail.view,
+                            view: &surface.target.view,
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
@@ -409,16 +477,9 @@ impl Module for DvdBounceModule {
                         multiview_mask: None,
                     });
                     drop(_pass);
-                    self.trail
-                        .as_mut()
-                        .expect("DvdBounceModule was not resized")
-                        .clear_pending = false;
+                    surface.target.clear_pending = false;
                 }
                 if self.state.changed_this_tick {
-                    let trail = self
-                        .trail
-                        .as_ref()
-                        .expect("DvdBounceModule was not resized");
                     context.queue.write_buffer(
                         uniforms,
                         0,
@@ -428,14 +489,10 @@ impl Module for DvdBounceModule {
                             self.state.slot_offset,
                         ),
                     );
-                    let pipeline = self
-                        .trail_pipeline
-                        .as_ref()
-                        .expect("DvdBounceModule was not initialized");
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("dvd-bounce persistent trail pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &trail.view,
+                            view: &surface.target.view,
                             depth_slice: None,
                             resolve_target: None,
                             // The Web FBO is cleared once at construction, not
@@ -450,19 +507,11 @@ impl Module for DvdBounceModule {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    pass.set_pipeline(pipeline);
+                    pass.set_pipeline(&resources.trail_pipeline);
                     pass.set_bind_group(0, block_bind_group, &[]);
                     pass.draw(0..6, 0..1);
                 }
 
-                let pipeline = self
-                    .copy_pipeline
-                    .as_ref()
-                    .expect("DvdBounceModule was not initialized");
-                let copy_bind_group = self
-                    .copy_bind_group
-                    .as_ref()
-                    .expect("DvdBounceModule was not resized");
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("dvd-bounce trail copy pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -479,12 +528,12 @@ impl Module for DvdBounceModule {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, copy_bind_group, &[]);
+                pass.set_pipeline(&resources.copy_pipeline);
+                pass.set_bind_group(0, &surface.copy_bind_group, &[]);
                 pass.draw(0..6, 0..1);
                 drop(pass);
 
-                if SMOOTH_TRAIL_FRONT {
+                if let Some(pipeline) = resources.smooth_front_pipeline.as_ref() {
                     let fraction = interpolation_fraction(frame.elapsed);
                     let center = [
                         self.state.position[0] as f32 + fraction * self.state.velocity[0] as f32,
@@ -495,10 +544,6 @@ impl Module for DvdBounceModule {
                         0,
                         &uniform_bytes(center, frame.size, self.state.slot_offset),
                     );
-                    let pipeline = self
-                        .direct_pipeline
-                        .as_ref()
-                        .expect("DvdBounceModule was not initialized");
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("dvd-bounce smooth trail front pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -705,6 +750,24 @@ fn interpolation_fraction(elapsed: Duration) -> f32 {
     ((elapsed.as_secs_f64() - tick * TICK_SECONDS) / TICK_SECONDS) as f32
 }
 
+fn initial_velocity(rng: &mut impl Rng) -> [i32; 2] {
+    loop {
+        let candidate = [
+            (rng.sample::<f64, _>(StandardNormal) * 7.0) as i32,
+            (rng.sample::<f64, _>(StandardNormal) * 7.0) as i32,
+        ];
+        if valid_initial_velocity(candidate) {
+            return candidate;
+        }
+    }
+}
+
+fn valid_initial_velocity([x, y]: [i32; 2]) -> bool {
+    let x_squared = i64::from(x) * i64::from(x);
+    let y_squared = i64::from(y) * i64::from(y);
+    x != 0 && y != 0 && x_squared + y_squared > 24
+}
+
 fn slot_offset(id: usize) -> [f32; 2] {
     [
         (id % (ATLAS_DIMENSION / TILE_DIMENSION) as usize) as f32,
@@ -782,7 +845,7 @@ fn srgb_to_linear(channel: f32) -> f32 {
 }
 
 @fragment
-fn fs_direct(input: BlockVertexOutput) -> @location(0) vec4<f32> {
+fn fs_direct_srgb(input: BlockVertexOutput) -> @location(0) vec4<f32> {
     let webgl_rgb = textureSample(blocks_texture, blocks_sampler, input.uv).rgb;
     return vec4<f32>(
         vec3<f32>(
@@ -794,8 +857,14 @@ fn fs_direct(input: BlockVertexOutput) -> @location(0) vec4<f32> {
     );
 }
 
+@fragment
+fn fs_direct_unorm(input: BlockVertexOutput) -> @location(0) vec4<f32> {
+    let webgl_rgb = textureSample(blocks_texture, blocks_sampler, input.uv).rgb;
+    return vec4<f32>(webgl_rgb, 1.0);
+}
+
 // The WebGL framebuffer stores the shader's unconverted numeric RGB. Preserve
-// that representation in Rgba8Unorm; fs_copy performs conversion when it is
+// that representation in Rgba8Unorm; the surface copy performs conversion
 // finally written to the Wayland surface.
 @fragment
 fn fs_trail(input: BlockVertexOutput) -> @location(0) vec4<f32> {
@@ -822,7 +891,7 @@ fn vs_copy(@builtin(vertex_index) index: u32) -> CopyVertexOutput {
 }
 
 @fragment
-fn fs_copy(input: CopyVertexOutput) -> @location(0) vec4<f32> {
+fn fs_copy_srgb(input: CopyVertexOutput) -> @location(0) vec4<f32> {
     let webgl_color = textureSample(trail_texture, trail_sampler, input.uv);
     return vec4<f32>(
         vec3<f32>(
@@ -833,13 +902,65 @@ fn fs_copy(input: CopyVertexOutput) -> @location(0) vec4<f32> {
         1.0,
     );
 }
+
+@fragment
+fn fs_copy_unorm(input: CopyVertexOutput) -> @location(0) vec4<f32> {
+    let webgl_rgb = textureSample(trail_texture, trail_sampler, input.uv).rgb;
+    return vec4<f32>(webgl_rgb, 1.0);
+}
 "#;
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::{RenderSize, interpolation_fraction, slot_offset, uniform_bytes};
+    use rand::SeedableRng;
+    use rand_hc::Hc128Rng;
+
+    use super::{
+        DvdBounceVariant, RenderSize, ResourceNeeds, initial_velocity, interpolation_fraction,
+        resource_needs, slot_offset, uniform_bytes, valid_initial_velocity,
+    };
+
+    #[test]
+    fn variant_resource_needs_exclude_unused_gpu_allocations() {
+        assert_eq!(
+            resource_needs(DvdBounceVariant::Direct, false),
+            ResourceNeeds {
+                direct_pipeline: true,
+                trail_pipeline: false,
+                trail_texture: false,
+                trail_copy_resources: false,
+            }
+        );
+        assert_eq!(
+            resource_needs(DvdBounceVariant::Direct, true),
+            ResourceNeeds {
+                direct_pipeline: true,
+                trail_pipeline: false,
+                trail_texture: false,
+                trail_copy_resources: false,
+            }
+        );
+        assert_eq!(
+            resource_needs(DvdBounceVariant::Trail, false),
+            ResourceNeeds {
+                direct_pipeline: false,
+                trail_pipeline: true,
+                trail_texture: true,
+                trail_copy_resources: true,
+            }
+        );
+        assert_eq!(
+            resource_needs(DvdBounceVariant::Trail, true),
+            ResourceNeeds {
+                direct_pipeline: true,
+                trail_pipeline: true,
+                trail_texture: true,
+                trail_copy_resources: true,
+            }
+        );
+    }
 
     #[test]
     fn slot_id_maps_to_the_webgl_column_and_row() {
@@ -847,6 +968,26 @@ mod tests {
         assert_eq!(slot_offset(31), [31.0, 0.0]);
         assert_eq!(slot_offset(32), [0.0, 1.0]);
         assert_eq!(slot_offset(462), [14.0, 14.0]);
+    }
+
+    #[test]
+    fn standard_normal_initial_velocity_is_deterministic_for_a_fixed_seed() {
+        let seed = [0x5a; 32];
+        let first = initial_velocity(&mut Hc128Rng::from_seed(seed));
+        let second = initial_velocity(&mut Hc128Rng::from_seed(seed));
+        assert_eq!(first, second);
+        assert_eq!(first, [-12, -15]);
+        assert!(valid_initial_velocity(first));
+    }
+
+    #[test]
+    fn initial_velocity_rejects_zero_components_and_short_vectors() {
+        for rejected in [[0, 10], [10, 0], [1, 1], [3, 3], [4, 2]] {
+            assert!(!valid_initial_velocity(rejected), "accepted {rejected:?}");
+        }
+        for accepted in [[1, 5], [-5, 1], [4, 3], [-4, -3]] {
+            assert!(valid_initial_velocity(accepted), "rejected {accepted:?}");
+        }
     }
 
     #[test]

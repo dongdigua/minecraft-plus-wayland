@@ -170,3 +170,35 @@ pub(super) fn background_color() -> wgpu::Color {
         a: 1.0,
     }
 }
+
+/// Selects whether a surface-writing shader must compensate for the target's
+/// automatic sRGB encode. Off-screen numeric-domain passes choose their entry
+/// explicitly instead of using this helper.
+pub(super) fn web_surface_fragment_entry(
+    surface_format: wgpu::TextureFormat,
+    srgb_entry: &'static str,
+    unorm_entry: &'static str,
+) -> &'static str {
+    if surface_format.is_srgb() {
+        srgb_entry
+    } else {
+        unorm_entry
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::web_surface_fragment_entry;
+
+    #[test]
+    fn web_fragment_entry_matches_surface_encoding() {
+        assert_eq!(
+            web_surface_fragment_entry(wgpu::TextureFormat::Bgra8UnormSrgb, "fs_srgb", "fs_unorm",),
+            "fs_srgb"
+        );
+        assert_eq!(
+            web_surface_fragment_entry(wgpu::TextureFormat::Rgba8Unorm, "fs_srgb", "fs_unorm",),
+            "fs_unorm"
+        );
+    }
+}

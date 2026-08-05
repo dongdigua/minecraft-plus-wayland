@@ -111,6 +111,8 @@ impl Renderer {
             .surface
             .get_default_config(&self.adapter, size.width.max(1), size.height.max(1))
             .ok_or("the selected adapter does not support the layer surface")?;
+        config.format = preferred_surface_format(&capabilities.formats)
+            .ok_or("the selected adapter reports no supported surface formats")?;
         if capabilities
             .present_modes
             .contains(&wgpu::PresentMode::Fifo)
@@ -215,5 +217,42 @@ impl Renderer {
                 raw_window_handle,
             })
         }
+    }
+}
+
+fn preferred_surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
+    formats
+        .iter()
+        .copied()
+        .find(wgpu::TextureFormat::is_srgb)
+        .or_else(|| formats.first().copied())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preferred_surface_format;
+
+    #[test]
+    fn surface_format_prefers_srgb_over_capability_order() {
+        assert_eq!(
+            preferred_surface_format(&[
+                wgpu::TextureFormat::Bgra8Unorm,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                wgpu::TextureFormat::Bgra8UnormSrgb,
+            ]),
+            Some(wgpu::TextureFormat::Rgba8UnormSrgb)
+        );
+    }
+
+    #[test]
+    fn surface_format_falls_back_to_first_non_srgb_format() {
+        assert_eq!(
+            preferred_surface_format(&[
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureFormat::Bgra8Unorm,
+            ]),
+            Some(wgpu::TextureFormat::Rgba8Unorm)
+        );
+        assert_eq!(preferred_surface_format(&[]), None);
     }
 }

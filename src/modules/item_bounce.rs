@@ -4,7 +4,7 @@ use obj::ObjData;
 use rand::{Rng, RngCore, SeedableRng};
 use rand_hc::Hc128Rng;
 
-use super::{FrameInfo, Module, RenderContext, RenderSize};
+use super::{FrameInfo, Module, RenderContext, RenderSize, web_surface_fragment_entry};
 
 const MANIFEST_RESOURCE: &str = "pop_items.txt";
 const ATLAS_RESOURCE: &str = "item_models/atlas.png";
@@ -187,11 +187,11 @@ impl Module for ItemBounceModule {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some(if context.surface_format.is_srgb() {
-                        "fs_copy_srgb"
-                    } else {
-                        "fs_copy_unorm"
-                    }),
+                    entry_point: Some(web_surface_fragment_entry(
+                        context.surface_format,
+                        "fs_copy_srgb",
+                        "fs_copy_unorm",
+                    )),
                     compilation_options: Default::default(),
                     targets: &[Some(context.surface_format.into())],
                 }),

@@ -2,7 +2,7 @@ use std::error::Error;
 
 use rand::Rng;
 
-use super::{FrameInfo, Module, RenderContext};
+use super::{FrameInfo, Module, RenderContext, web_surface_fragment_entry};
 
 const BLOCK_LIST_RESOURCE: &str = "full_blocks.txt";
 const BLOCK_TEXTURE_RESOURCE: &str = "full_blocks.png";
@@ -197,7 +197,11 @@ impl Module for BlocksModule {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(web_surface_fragment_entry(
+                        context.surface_format,
+                        "fs_srgb",
+                        "fs_unorm",
+                    )),
                     compilation_options: Default::default(),
                     targets: &[Some(context.surface_format.into())],
                 }),
@@ -412,8 +416,7 @@ fn srgb_to_linear(channel: f32) -> f32 {
     return pow((channel + 0.055) / 1.055, 2.4);
 }
 
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn web_color(input: VertexOutput) -> vec4<f32> {
     let slot_position = floor(input.tex);
     let slot_fraction = fract(input.tex);
     let slot_id = floor(uniforms.slot_count * rand_like_glsl(
@@ -430,18 +433,27 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     ) + vec2<f32>(0.5);
     let atlas_uv = (vec2<f32>(slot_column, slot_row) + position_in_slot)
         / uniforms.line_width;
-    let webgl_color = textureSample(blocks_texture, blocks_sampler, atlas_uv);
-    // The source texture is numeric RGB and the original WebGL default canvas
-    // presents that numeric value as sRGB. Convert to linear for a Wayland
-    // sRGB render target, as the other native image-backed modules do.
+    return vec4<f32>(textureSample(blocks_texture, blocks_sampler, atlas_uv).rgb, 1.0);
+}
+
+@fragment
+fn fs_srgb(input: VertexOutput) -> @location(0) vec4<f32> {
+    // The atlas sample is the complete Web numeric result. Convert only when
+    // the surface target will apply an automatic sRGB encode.
+    let color = web_color(input);
     return vec4<f32>(
         vec3<f32>(
-            srgb_to_linear(webgl_color.r),
-            srgb_to_linear(webgl_color.g),
-            srgb_to_linear(webgl_color.b),
+            srgb_to_linear(color.r),
+            srgb_to_linear(color.g),
+            srgb_to_linear(color.b),
         ),
         1.0,
     );
+}
+
+@fragment
+fn fs_unorm(input: VertexOutput) -> @location(0) vec4<f32> {
+    return web_color(input);
 }
 "#;
 

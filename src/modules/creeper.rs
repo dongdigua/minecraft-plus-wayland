@@ -1,9 +1,8 @@
 use std::error::Error;
 
-use rand::{RngCore, SeedableRng};
-use rand_hc::Hc128Rng;
+use rand::Rng;
 
-use super::{FrameInfo, Module, RenderContext, RenderSize};
+use super::{FrameInfo, Module, RenderContext, RenderSize, web_surface_fragment_entry};
 
 const CREEPER_RESOURCE: &str = "creeper.png";
 const CREEPER_DIMENSION: u32 = 8;
@@ -184,7 +183,11 @@ impl Module for CreeperModule {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(web_surface_fragment_entry(
+                        context.surface_format,
+                        "fs_srgb",
+                        "fs_unorm",
+                    )),
                     compilation_options: Default::default(),
                     targets: &[Some(context.surface_format.into())],
                 }),
@@ -311,14 +314,10 @@ impl DepthTarget {
     }
 }
 
-/// Use the Web build's rand 0.6 HC-128 core. The 32-byte native entropy seed
-/// cannot reproduce a browser launch, but `next_u32() >> 8` uses the same
-/// 24-bit `[0, 1)` conversion captured from module=12's WASM setup path.
+/// Match the Web module's `thread_rng().gen::<f32>()`: rand 0.6 uses the
+/// HC-128-backed thread RNG and maps the upper 24 bits to `[0, 1)`.
 fn random_seed() -> f32 {
-    let mut entropy = [0; 32];
-    rand::thread_rng().fill_bytes(&mut entropy);
-    let mut random = Hc128Rng::from_seed(entropy);
-    (random.next_u32() >> 8) as f32 / 16_777_216.0
+    rand::thread_rng().r#gen::<f32>()
 }
 
 fn uniform_bytes(time: f32, seed: f32, width: f32, height: f32) -> [u8; UNIFORM_BYTES] {
@@ -419,27 +418,33 @@ fn srgb_to_linear(channel: f32) -> f32 {
     return pow((channel + 0.055) / 1.055, 2.4);
 }
 
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    // WebGL uploads the decoded PNG as a linear RGBA8 texture and its legacy
-    // drawing buffer presents the shader's numeric output as sRGB. wgpu picks
-    // an sRGB Wayland surface, whose render target instead encodes fragment
-    // output. Convert the exact WebGL numeric RGB result back to linear before
-    // that target conversion, keeping the observed RGB * scale^4 appearance.
+fn web_color(input: VertexOutput) -> vec4<f32> {
     let sampled = textureSample(creeper_texture, creeper_sampler, input.uv);
     let dim = pow(input.dim, 4.0);
-    let webgl_rgb = sampled.rgb * dim;
+    // The target is a wallpaper, not a translucent overlay. The WebGL
+    // shader's alpha is useful inside its own canvas backing store, but
+    // exposing it to Wayland reveals the previous wallpaper.
+    return vec4<f32>(sampled.rgb * dim, 1.0);
+}
+
+@fragment
+fn fs_srgb(input: VertexOutput) -> @location(0) vec4<f32> {
+    // Compute sampled.rgb * scale^4 in the Web numeric domain first, then
+    // compensate for the surface target's automatic sRGB encode.
+    let color = web_color(input);
     return vec4<f32>(
         vec3<f32>(
-            srgb_to_linear(webgl_rgb.r),
-            srgb_to_linear(webgl_rgb.g),
-            srgb_to_linear(webgl_rgb.b),
+            srgb_to_linear(color.r),
+            srgb_to_linear(color.g),
+            srgb_to_linear(color.b),
         ),
-        // The target is a wallpaper, not a translucent overlay. The WebGL
-        // shader's alpha is useful inside its own canvas backing store, but
-        // exposing it to Wayland reveals the previous wallpaper.
         1.0,
     );
+}
+
+@fragment
+fn fs_unorm(input: VertexOutput) -> @location(0) vec4<f32> {
+    return web_color(input);
 }
 "#;
 

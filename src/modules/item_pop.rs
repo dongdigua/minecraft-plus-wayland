@@ -1,4 +1,4 @@
-use super::{FrameInfo, Module, RenderContext, RenderSize};
+use super::{FrameInfo, Module, RenderContext, RenderSize, web_surface_fragment_entry};
 use obj::ObjData;
 use rand::{Rng, RngCore, SeedableRng, distributions::StandardNormal};
 use rand_hc::Hc128Rng;
@@ -7,6 +7,7 @@ use std::{error::Error, io::Cursor};
 const MAX_ITEMS: usize = 10;
 const TICKS: f64 = 3.0;
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// Web module=3: randomly selected OBJ items fly, land, bob/rotate, then
 /// expire after 90 Web ticks (30 seconds).
@@ -59,7 +60,9 @@ impl Module for ItemPopModule {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            // WebGL samples the decoded atlas bytes as numeric values, with no
+            // sRGB decode at the texture boundary.
+            format: ATLAS_FORMAT,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -146,7 +149,11 @@ impl Module for ItemPopModule {
                     },
                     fragment: Some(wgpu::FragmentState {
                         module: &shader,
-                        entry_point: Some("fs_main"),
+                        entry_point: Some(web_surface_fragment_entry(
+                            c.surface_format,
+                            "fs_srgb",
+                            "fs_unorm",
+                        )),
                         compilation_options: Default::default(),
                         targets: &[Some(c.surface_format.into())],
                     }),
@@ -510,8 +517,11 @@ fn deindex_obj(name: &str, obj: &ObjData) -> Vec<Vertex> {
                         let normal = tuple
                             .2
                             .unwrap_or_else(|| panic!("{name}: missing normal index"));
+                        let position = obj.position[tuple.0];
                         vertices.push(Vertex {
-                            position: obj.position[tuple.0],
+                            position: [position[0] - 0.5, position[1], position[2] - 0.5],
+                            // Preserve the OBJ UV. The shader performs the sole
+                            // WebGL-to-WGPU V-axis mirror at sampling time.
                             uv: obj.texture[texture],
                             normal: obj.normal[normal],
                         });
@@ -675,12 +685,42 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     return output;
 }
 
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn srgb_to_linear(channel: f32) -> f32 {
+    if (channel <= 0.04045) {
+        return channel / 12.92;
+    }
+    return pow((channel + 0.055) / 1.055, 2.4);
+}
+
+fn atlas_color(input: VertexOutput) -> vec4<f32> {
     // WebGL's raw RGBA upload addresses the PNG's first row at its lower
     // texture edge. WGPU addresses it at its upper edge, so mirror V at the
     // sampling boundary while preserving the OBJ's original UV data.
-    let color = textureSample(atlas, atlas_sampler, vec2<f32>(input.uv.x, 1.0 - input.uv.y));
+    return textureSample(atlas, atlas_sampler, vec2<f32>(input.uv.x, 1.0 - input.uv.y));
+}
+
+@fragment
+fn fs_srgb(input: VertexOutput) -> @location(0) vec4<f32> {
+    let color = atlas_color(input);
+    if (color.a < 0.1) {
+        discard;
+    }
+    // Lighting is part of the Web framebuffer value. Convert only after the
+    // texture and lighting terms have produced that final numeric RGB.
+    let web_rgb = color.rgb * input.light;
+    return vec4<f32>(
+        vec3<f32>(
+            srgb_to_linear(web_rgb.r),
+            srgb_to_linear(web_rgb.g),
+            srgb_to_linear(web_rgb.b),
+        ),
+        color.a,
+    );
+}
+
+@fragment
+fn fs_unorm(input: VertexOutput) -> @location(0) vec4<f32> {
+    let color = atlas_color(input);
     if (color.a < 0.1) {
         discard;
     }
@@ -690,6 +730,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use obj::ObjData;
+
     use super::load_manifest;
 
     #[test]
@@ -697,6 +741,28 @@ mod tests {
         let mut models = load_manifest().expect("valid item-pop manifest");
         assert_eq!(models.len(), 1_044);
         assert!(!models[0].vertices().is_empty());
+    }
+
+    #[test]
+    fn resource_obj_expansion_centers_xz_without_changing_y_or_uv() {
+        let mut models = load_manifest().expect("valid item-pop manifest");
+        let source = crate::resources::load_utf8(&models[0].name).expect("manifest OBJ exists");
+        let obj = ObjData::load_buf(Cursor::new(source.into_bytes())).expect("valid manifest OBJ");
+        let tuple = obj.objects[0].groups[0].polys[0].0[0];
+        let source_position = obj.position[tuple.0];
+        let source_uv = obj.texture[tuple.1.expect("textured OBJ vertex")];
+        let expanded = models[0].vertices()[0];
+
+        assert_eq!(
+            expanded.position,
+            [
+                source_position[0] - 0.5,
+                source_position[1],
+                source_position[2] - 0.5,
+            ]
+        );
+        assert_eq!(expanded.uv, source_uv);
+        assert!(super::SHADER.contains("1.0 - input.uv.y"));
     }
 
     #[test]

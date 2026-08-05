@@ -1,8 +1,9 @@
 use std::error::Error;
 
+use rand::RngCore;
 use wasmi::{Engine, ExternType, Linker, Memory, Module as WasmModule, Store, Val};
 
-use super::{FrameInfo, Module, RenderContext, RenderSize};
+use super::{FrameInfo, Module, RenderContext, RenderSize, web_surface_fragment_entry};
 
 const GRID_SIZE: u32 = 16;
 const INSTANCE_COUNT: u32 = GRID_SIZE * GRID_SIZE;
@@ -39,7 +40,7 @@ pub struct AlphaFluidsModule {
     water_runtime: Option<OriginalWaterRuntime>,
     lava_runtime: Option<OriginalLavaRuntime>,
     runtime_texels: Option<([u8; TEXTURE_BYTES], [u8; TEXTURE_BYTES])>,
-    last_tick: u64,
+    last_tick: Option<u64>,
     textures_dirty: bool,
 }
 
@@ -55,8 +56,8 @@ impl AlphaFluidsModule {
             water_runtime: None,
             lava_runtime: None,
             runtime_texels: None,
-            last_tick: 0,
-            textures_dirty: true,
+            last_tick: None,
+            textures_dirty: false,
         }
     }
 
@@ -160,7 +161,11 @@ impl Module for AlphaFluidsModule {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(web_surface_fragment_entry(
+                        context.surface_format,
+                        "fs_srgb",
+                        "fs_unorm",
+                    )),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: context.surface_format,
@@ -200,17 +205,16 @@ impl Module for AlphaFluidsModule {
         self.bind_group = Some(bind_group);
         self.uniforms = Some(uniforms);
         self.textures = Some(FluidTextures { still, flowing });
-        self.runtime_texels = Some(match self.variant {
+        match self.variant {
             AlphaFluidVariant::Water => {
                 self.water_runtime = Some(OriginalWaterRuntime::new()?);
-                water_base_texels()
             }
             AlphaFluidVariant::Lava => {
                 self.lava_runtime = Some(OriginalLavaRuntime::new()?);
-                lava_base_texels()
             }
-        });
-        self.upload_textures(context);
+        }
+        // The first frame's update performs the first and only initial WASM
+        // step. No synthetic raster is uploaded while runtime_texels is None.
         Ok(())
     }
 
@@ -220,32 +224,28 @@ impl Module for AlphaFluidsModule {
 
     fn update(&mut self, frame: FrameInfo) {
         let tick = (frame.elapsed.as_secs_f32().max(0.0) / TICK_SECONDS).floor() as u64;
-        if tick <= self.last_tick {
+        if !advance_observed_bucket(&mut self.last_tick, tick) {
             return;
         }
 
-        // A compositor resume can make elapsed time jump considerably. The
-        // browser skips intermediate visual frames too, so cap catch-up work
-        // rather than allocating an unbounded amount of CPU to old ticks.
-        let first_tick = tick.saturating_sub(32).max(self.last_tick);
-        for _ in first_tick..tick {
-            let texels = match self.variant {
-                AlphaFluidVariant::Water => self
-                    .water_runtime
-                    .as_mut()
-                    .expect("Water runtime was not initialized")
-                    .tick()
-                    .expect("original Web water function trapped"),
-                AlphaFluidVariant::Lava => self
-                    .lava_runtime
-                    .as_mut()
-                    .expect("Lava runtime was not initialized")
-                    .tick()
-                    .expect("original Web lava function trapped"),
-            };
-            self.runtime_texels = Some(texels);
-        }
-        self.last_tick = tick;
+        // Web advances at most once when it observes a new 50 ms bucket. A
+        // compositor time jump therefore performs one current update and
+        // discards every unobserved intermediate bucket.
+        let texels = match self.variant {
+            AlphaFluidVariant::Water => self
+                .water_runtime
+                .as_mut()
+                .expect("Water runtime was not initialized")
+                .tick()
+                .expect("original Web water step failed before producing textures"),
+            AlphaFluidVariant::Lava => self
+                .lava_runtime
+                .as_mut()
+                .expect("Lava runtime was not initialized")
+                .tick()
+                .expect("original Web lava step failed before producing textures"),
+        };
+        self.runtime_texels = Some(texels);
         self.textures_dirty = true;
     }
 
@@ -419,20 +419,12 @@ fn write_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, bytes: &[u8; TEXT
     );
 }
 
-fn water_base_texels() -> ([u8; TEXTURE_BYTES], [u8; TEXTURE_BYTES]) {
-    let mut texels = [0; TEXTURE_BYTES];
-    for pixel in texels.chunks_exact_mut(4) {
-        pixel.copy_from_slice(&[32, 50, 146, 255]);
+fn advance_observed_bucket(last_tick: &mut Option<u64>, tick: u64) -> bool {
+    if last_tick.is_some_and(|last_tick| tick <= last_tick) {
+        return false;
     }
-    (texels, texels)
-}
-
-fn lava_base_texels() -> ([u8; TEXTURE_BYTES], [u8; TEXTURE_BYTES]) {
-    let mut texels = [0; TEXTURE_BYTES];
-    for pixel in texels.chunks_exact_mut(4) {
-        pixel.copy_from_slice(&[155, 0, 0, 255]);
-    }
-    (texels, texels)
+    *last_tick = Some(tick);
+    true
 }
 
 /// The captured column-major WebGL matrix, generalized for the native surface
@@ -543,28 +535,48 @@ fn vs_main(
     return output;
 }
 
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn web_color(input: VertexOutput) -> vec4<f32> {
     let still = textureSample(still_texture, fluid_sampler, input.uv);
     let flowing = textureSample(flowing_texture, fluid_sampler, input.uv);
     let sample = select(still, flowing, input.flowing > 0.0);
-    // WebGL writes numeric colour values straight into its canvas. The wgpu
-    // Wayland target is normally sRGB, so encode the same perceived result.
-    let webgl_rgb = sample.rgb * sample.a * input.light;
+    return vec4<f32>(sample.rgb * sample.a * input.light, 1.0);
+}
+
+@fragment
+fn fs_srgb(input: VertexOutput) -> @location(0) vec4<f32> {
+    let color = web_color(input);
     return vec4<f32>(
         vec3<f32>(
-            srgb_to_linear(webgl_rgb.r),
-            srgb_to_linear(webgl_rgb.g),
-            srgb_to_linear(webgl_rgb.b),
+            srgb_to_linear(color.r),
+            srgb_to_linear(color.g),
+            srgb_to_linear(color.b),
         ),
         1.0,
     );
+}
+
+@fragment
+fn fs_unorm(input: VertexOutput) -> @location(0) vec4<f32> {
+    return web_color(input);
 }
 "#;
 
 #[cfg(test)]
 mod tests {
-    use super::{GRID_SIZE, RenderSize, alpha_fluids_mvp, matrix_bytes};
+    use super::{GRID_SIZE, RenderSize, advance_observed_bucket, alpha_fluids_mvp, matrix_bytes};
+
+    #[test]
+    fn observed_buckets_step_once_without_catching_up() {
+        let mut last_tick = None;
+        let observed = [0, 0, 1, 10_000, 10_000, 75_000];
+        let steps = observed
+            .into_iter()
+            .filter(|tick| advance_observed_bucket(&mut last_tick, *tick))
+            .count();
+
+        assert_eq!(steps, 4);
+        assert_eq!(last_tick, Some(75_000));
+    }
 
     #[test]
     fn mvp_matches_the_captured_widescreen_values() {
@@ -587,10 +599,34 @@ const LAVA_STEP_EXPORT: &str = "__minecraft_plus_lava_step";
 const WATER_STEP_FUNCTION: u32 = 116;
 const WATER_STEP_EXPORT: &str = "__minecraft_plus_water_step";
 const WEBGL_TEX_IMAGE_2D: &str = "__wbg_texImage2D_1c4b87cd146e7590";
+const GET_RANDOM_VALUES: &str = "__wbg_getRandomValues_1ef11e888e5228e9";
+const RANDOM_FILL_SYNC: &str = "__wbg_randomFillSync_1b52c8482374c55b";
+const GL_TEXTURE_2D: i32 = 3_553;
+const GL_RGBA: i32 = 6_408;
+const GL_UNSIGNED_BYTE: i32 = 5_121;
 
 #[derive(Default)]
 struct RuntimeState {
     uploads: Vec<[u8; PIXEL_BYTES]>,
+    // Tests can replace system entropy with a fixed byte without changing the
+    // production path or introducing a second pseudo-random implementation.
+    #[cfg(test)]
+    fixed_entropy: Option<u8>,
+    #[cfg(test)]
+    entropy_writes: Vec<(usize, Vec<u8>)>,
+}
+
+impl RuntimeState {
+    fn entropy(&mut self, length: usize) -> Vec<u8> {
+        let mut bytes = vec![0; length];
+        #[cfg(test)]
+        if let Some(byte) = self.fixed_entropy {
+            bytes.fill(byte);
+            return bytes;
+        }
+        rand::thread_rng().fill_bytes(&mut bytes);
+        bytes
+    }
 }
 
 /// Executes the original Web `func[143]` lava update directly in wasmi.
@@ -610,49 +646,18 @@ pub(super) struct OriginalLavaRuntime {
 
 impl OriginalLavaRuntime {
     pub(super) fn new() -> Result<Self, Box<dyn Error>> {
+        Self::new_with_state(RuntimeState::default())
+    }
+
+    fn new_with_state(runtime_state: RuntimeState) -> Result<Self, Box<dyn Error>> {
         let wasm = crate::resources::load_web_wasm()?;
         let wasm = export_internal_function(&wasm, LAVA_STEP_EXPORT, LAVA_STEP_FUNCTION)?;
 
         let engine = Engine::default();
         let module = WasmModule::new(&engine, &wasm[..])?;
         let mut linker = Linker::<RuntimeState>::new(&engine);
-        for import in module.imports() {
-            let ExternType::Func(function_type) = import.ty() else {
-                return Err(format!(
-                    "unexpected non-function Web import {}::{}",
-                    import.module(),
-                    import.name()
-                )
-                .into());
-            };
-            let result_types = function_type.results().to_vec();
-            let captures_upload = import.name() == WEBGL_TEX_IMAGE_2D;
-            linker.func_new(
-                import.module(),
-                import.name(),
-                function_type.clone(),
-                move |mut caller, params, results| {
-                    if captures_upload && params.len() >= 11 {
-                        let pointer = params[9].i32().unwrap_or_default().max(0) as usize;
-                        let length = params[10].i32().unwrap_or_default().max(0) as usize;
-                        if length == PIXEL_BYTES
-                            && let Some(memory) = caller
-                                .get_export("memory")
-                                .and_then(|export| export.into_memory())
-                        {
-                            let mut upload = [0; PIXEL_BYTES];
-                            memory.read(&caller, pointer, &mut upload)?;
-                            caller.data_mut().uploads.push(upload);
-                        }
-                    }
-                    for (result, value_type) in results.iter_mut().zip(&result_types) {
-                        *result = Val::default(*value_type);
-                    }
-                    Ok(())
-                },
-            )?;
-        }
-        let mut store = Store::new(&engine, RuntimeState::default());
+        define_web_import_stubs(&module, &mut linker)?;
+        let mut store = Store::new(&engine, runtime_state);
         let instance = linker.instantiate_and_start(&mut store, &module)?;
         let memory = instance
             .get_memory(&store, "memory")
@@ -708,18 +713,22 @@ pub(super) struct OriginalWaterRuntime {
     step: wasmi::TypedFunc<(i32, f64), ()>,
     state: i32,
     tick: u64,
-    last_uploads: ([u8; PIXEL_BYTES], [u8; PIXEL_BYTES]),
+    last_uploads: Option<([u8; PIXEL_BYTES], [u8; PIXEL_BYTES])>,
 }
 
 impl OriginalWaterRuntime {
     pub(super) fn new() -> Result<Self, Box<dyn Error>> {
+        Self::new_with_state(RuntimeState::default())
+    }
+
+    fn new_with_state(runtime_state: RuntimeState) -> Result<Self, Box<dyn Error>> {
         let wasm = crate::resources::load_web_wasm()?;
         let wasm = export_internal_function(&wasm, WATER_STEP_EXPORT, WATER_STEP_FUNCTION)?;
         let engine = Engine::default();
         let module = WasmModule::new(&engine, &wasm[..])?;
         let mut linker = Linker::<RuntimeState>::new(&engine);
         define_web_import_stubs(&module, &mut linker)?;
-        let mut store = Store::new(&engine, RuntimeState::default());
+        let mut store = Store::new(&engine, runtime_state);
         let instance = linker.instantiate_and_start(&mut store, &module)?;
         let memory = instance
             .get_memory(&store, "memory")
@@ -735,9 +744,11 @@ impl OriginalWaterRuntime {
         for (offset, value) in [
             (92, pixels),
             (100, PIXEL_BYTES as i32),
-            (104, 16),
-            (108, 16),
-            (112, 6_408),
+            // func[116] forwards field 104 as both internalformat and format,
+            // followed by width and height from fields 108 and 112.
+            (104, GL_RGBA),
+            (108, GRID_SIZE as i32),
+            (112, GRID_SIZE as i32),
         ] {
             memory.write(&mut store, state as usize + offset, &value.to_le_bytes())?;
         }
@@ -746,7 +757,7 @@ impl OriginalWaterRuntime {
             step,
             state,
             tick: 0,
-            last_uploads: water_base_texels(),
+            last_uploads: None,
         })
     }
 
@@ -759,12 +770,17 @@ impl OriginalWaterRuntime {
             .call(&mut self.store, (self.state, self.tick as f64 * 0.05))?;
         let uploads = &self.store.data().uploads;
         match uploads.len() {
-            0 => {
-                // func[116] gates its texture writes by floor(time / .05).
-                // A repeated bucket is not a fault: WebGL retains the prior
-                // textures, so return the exact last pair rather than panic.
+            0 if self.last_uploads.is_some() => {
+                // func[116] gates texture writes by floor(time / .05). If
+                // floating-point rounding repeats a bucket after a successful
+                // capture, WebGL keeps the prior pair.
             }
-            2 => self.last_uploads = (uploads[0], uploads[1]),
+            0 => {
+                return Err(
+                    "original Web water function produced no initial texture uploads".into(),
+                );
+            }
+            2 => self.last_uploads = Some((uploads[0], uploads[1])),
             count => {
                 return Err(format!(
                     "original Web water function produced {count} texture uploads, expected 0 or 2"
@@ -772,7 +788,8 @@ impl OriginalWaterRuntime {
                 .into());
             }
         }
-        Ok(self.last_uploads)
+        self.last_uploads
+            .ok_or_else(|| "original Web water raster capture was not initialized".into())
     }
 }
 
@@ -780,6 +797,13 @@ fn define_web_import_stubs(
     module: &WasmModule,
     linker: &mut Linker<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
+    #[derive(Clone, Copy)]
+    enum ImportBehavior {
+        Stub,
+        CaptureUpload,
+        FillEntropy,
+    }
+
     for import in module.imports() {
         let ExternType::Func(function_type) = import.ty() else {
             return Err(format!(
@@ -790,23 +814,28 @@ fn define_web_import_stubs(
             .into());
         };
         let result_types = function_type.results().to_vec();
-        let captures_upload = import.name() == WEBGL_TEX_IMAGE_2D;
+        let behavior = match import.name() {
+            WEBGL_TEX_IMAGE_2D => ImportBehavior::CaptureUpload,
+            GET_RANDOM_VALUES | RANDOM_FILL_SYNC => ImportBehavior::FillEntropy,
+            _ => ImportBehavior::Stub,
+        };
+        let import_name = import.name().to_owned();
         linker.func_new(
             import.module(),
             import.name(),
             function_type.clone(),
             move |mut caller, params, results| {
-                if captures_upload && params.len() >= 11 {
-                    let pointer = params[9].i32().unwrap_or_default().max(0) as usize;
-                    let length = params[10].i32().unwrap_or_default().max(0) as usize;
-                    if length == PIXEL_BYTES
-                        && let Some(memory) = caller
-                            .get_export("memory")
-                            .and_then(|export| export.into_memory())
-                    {
-                        let mut upload = [0; PIXEL_BYTES];
-                        memory.read(&caller, pointer, &mut upload)?;
-                        caller.data_mut().uploads.push(upload);
+                match behavior {
+                    ImportBehavior::Stub => {
+                        // These values exist only to satisfy the original
+                        // module's JS ABI. In particular, zero-valued handles
+                        // are not treated as real JavaScript objects.
+                    }
+                    ImportBehavior::CaptureUpload => {
+                        capture_texture_upload(&mut caller, params, &import_name)?;
+                    }
+                    ImportBehavior::FillEntropy => {
+                        fill_guest_entropy(&mut caller, params, &import_name)?;
                     }
                 }
                 for (result, value_type) in results.iter_mut().zip(&result_types) {
@@ -817,6 +846,101 @@ fn define_web_import_stubs(
         )?;
     }
     Ok(())
+}
+
+fn capture_texture_upload(
+    caller: &mut wasmi::Caller<'_, RuntimeState>,
+    params: &[Val],
+    import_name: &str,
+) -> Result<(), wasmi::Error> {
+    if params.len() != 11 {
+        return Err(wasmi::Error::new(format!(
+            "{import_name} received {} parameters, expected 11",
+            params.len()
+        )));
+    }
+    for (index, expected, label) in [
+        (1, GL_TEXTURE_2D, "target"),
+        (2, 0, "level"),
+        (3, GL_RGBA, "internalformat"),
+        (4, GRID_SIZE as i32, "width"),
+        (5, GRID_SIZE as i32, "height"),
+        (6, 0, "border"),
+        (7, GL_RGBA, "format"),
+        (8, GL_UNSIGNED_BYTE, "type"),
+        (10, PIXEL_BYTES as i32, "length"),
+    ] {
+        let actual = i32_parameter(params, index, import_name)?;
+        if actual != expected {
+            return Err(wasmi::Error::new(format!(
+                "{import_name} received invalid {label} {actual}, expected {expected}"
+            )));
+        }
+    }
+
+    let (memory, pointer, length) = checked_guest_range(caller, params, 9, 10, import_name)?;
+    debug_assert_eq!(length, PIXEL_BYTES);
+    let mut upload = [0; PIXEL_BYTES];
+    memory.read(&*caller, pointer, &mut upload)?;
+    caller.data_mut().uploads.push(upload);
+    Ok(())
+}
+
+fn fill_guest_entropy(
+    caller: &mut wasmi::Caller<'_, RuntimeState>,
+    params: &[Val],
+    import_name: &str,
+) -> Result<(), wasmi::Error> {
+    if params.len() != 3 {
+        return Err(wasmi::Error::new(format!(
+            "{import_name} received {} parameters, expected 3",
+            params.len()
+        )));
+    }
+    // params[0] is an opaque wasm-bindgen JS handle. It is deliberately not
+    // dereferenced or otherwise represented as a native object.
+    let (memory, pointer, length) = checked_guest_range(caller, params, 1, 2, import_name)?;
+    let bytes = caller.data_mut().entropy(length);
+    memory.write(&mut *caller, pointer, &bytes)?;
+    #[cfg(test)]
+    caller.data_mut().entropy_writes.push((pointer, bytes));
+    Ok(())
+}
+
+fn checked_guest_range(
+    caller: &wasmi::Caller<'_, RuntimeState>,
+    params: &[Val],
+    pointer_index: usize,
+    length_index: usize,
+    import_name: &str,
+) -> Result<(Memory, usize, usize), wasmi::Error> {
+    let pointer = i32_parameter(params, pointer_index, import_name)?;
+    let length = i32_parameter(params, length_index, import_name)?;
+    let pointer = usize::try_from(pointer)
+        .map_err(|_| wasmi::Error::new(format!("{import_name} received negative guest pointer")))?;
+    let length = usize::try_from(length)
+        .map_err(|_| wasmi::Error::new(format!("{import_name} received negative length")))?;
+    let memory = caller
+        .get_export("memory")
+        .and_then(|export| export.into_memory())
+        .ok_or_else(|| wasmi::Error::new(format!("{import_name} could not access guest memory")))?;
+    let end = pointer
+        .checked_add(length)
+        .ok_or_else(|| wasmi::Error::new(format!("{import_name} guest range overflow")))?;
+    if end > memory.data_size(caller) {
+        return Err(wasmi::Error::new(format!(
+            "{import_name} guest range {pointer}..{end} exceeds memory size {}",
+            memory.data_size(caller)
+        )));
+    }
+    Ok((memory, pointer, length))
+}
+
+fn i32_parameter(params: &[Val], index: usize, import_name: &str) -> Result<i32, wasmi::Error> {
+    params
+        .get(index)
+        .and_then(Val::i32)
+        .ok_or_else(|| wasmi::Error::new(format!("{import_name} parameter {index} is not i32")))
 }
 
 fn export_internal_function(
@@ -895,7 +1019,7 @@ fn write_uleb(bytes: &mut Vec<u8>, mut value: u32) {
 mod wasm_runtime_tests {
     use super::{
         LAVA_STEP_EXPORT, LAVA_STEP_FUNCTION, OriginalLavaRuntime, OriginalWaterRuntime,
-        PIXEL_BYTES, export_internal_function,
+        PIXEL_BYTES, RuntimeState, export_internal_function,
     };
 
     #[test]
@@ -931,13 +1055,40 @@ mod wasm_runtime_tests {
     #[test]
     fn original_water_function_executes_and_captures_both_uploads() {
         let mut runtime = OriginalWaterRuntime::new().unwrap();
+        assert!(runtime.last_uploads.is_none());
         let (still, flowing) = runtime.tick().unwrap();
+        assert!(runtime.last_uploads.is_some());
         assert_eq!(&still[..4], &[32, 50, 146, 255]);
         assert_eq!(&flowing[..4], &[32, 50, 146, 255]);
+
+        // Repeating the same internal time bucket yields no new WebGL upload,
+        // but is valid after the initial pair has been captured.
+        runtime.tick -= 1;
+        let repeated = runtime.tick().unwrap();
+        assert_eq!(repeated, (still, flowing));
+
         for _ in 0..32 {
             let (still, flowing) = runtime.tick().unwrap();
             assert_eq!(still.len(), PIXEL_BYTES);
             assert_eq!(flowing.len(), PIXEL_BYTES);
         }
+    }
+
+    #[test]
+    fn wasm_entropy_import_writes_injected_nonzero_bytes() {
+        let state = RuntimeState {
+            fixed_entropy: Some(0xa5),
+            ..RuntimeState::default()
+        };
+        let mut runtime = OriginalWaterRuntime::new_with_state(state).unwrap();
+        runtime.tick().unwrap();
+
+        let writes = &runtime.store.data().entropy_writes;
+        assert!(!writes.is_empty());
+        assert!(
+            writes
+                .iter()
+                .all(|(_, bytes)| !bytes.is_empty() && bytes.iter().all(|byte| *byte == 0xa5))
+        );
     }
 }

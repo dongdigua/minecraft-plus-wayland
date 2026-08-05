@@ -1,14 +1,14 @@
-use std::{
-    error::Error,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::error::Error;
 
-use super::{FrameInfo, Module, RenderContext, RenderSize};
+use rand::{Rng, seq::SliceRandom};
+
+use super::{FrameInfo, Module, RenderContext, RenderSize, web_surface_fragment_entry};
 
 const PANORAMA_LIST_RESOURCE: &str = "panoramas.txt";
 const PANORAMA_PREFIX: &str = "panoramas";
 const CUBEMAP_FACE_COUNT: u32 = 6;
 const CUBEMAP_FACE_SIZE: u32 = 1024;
+const CUBEMAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 // The source bundle uses four horizontal faces followed by top and bottom;
 // WebGL uploads them to cubemap layers as +X <- 1, -X <- 3, +Y <- 4,
 // -Y <- 5, +Z <- 0, -Z <- 2.
@@ -26,7 +26,6 @@ pub struct PanoramaModule {
     bind_group: Option<wgpu::BindGroup>,
     uniforms: Option<wgpu::Buffer>,
     initial_yaw_degrees: f32,
-    random: SplitMix64,
 }
 
 impl Default for PanoramaModule {
@@ -36,7 +35,6 @@ impl Default for PanoramaModule {
             bind_group: None,
             uniforms: None,
             initial_yaw_degrees: 0.0,
-            random: SplitMix64::new(seed_from_clock()),
         }
     }
 }
@@ -44,8 +42,11 @@ impl Default for PanoramaModule {
 impl Module for PanoramaModule {
     fn initialize(&mut self, context: &RenderContext<'_>) -> Result<(), Box<dyn Error>> {
         let panorama_names = panorama_names()?;
-        let panorama_name = panorama_names[self.random.index(panorama_names.len())?].as_str();
-        self.initial_yaw_degrees = self.random.unit_f32() * 360.0;
+        let mut random = rand::thread_rng();
+        let panorama_name = panorama_names
+            .choose(&mut random)
+            .ok_or("cannot choose from an empty panorama list")?;
+        self.initial_yaw_degrees = random.gen_range(0.0_f32, 360.0);
 
         let faces = load_faces(panorama_name)?;
         let texture = context.device.create_texture(&wgpu::TextureDescriptor {
@@ -58,7 +59,9 @@ impl Module for PanoramaModule {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            // WebGL filters the decoded PNG channel values without an sRGB
+            // decode, so keep interpolation in that same numeric domain.
+            format: CUBEMAP_FORMAT,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -196,7 +199,11 @@ impl Module for PanoramaModule {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(web_surface_fragment_entry(
+                        context.surface_format,
+                        "fs_srgb",
+                        "fs_unorm",
+                    )),
                     compilation_options: Default::default(),
                     targets: &[Some(context.surface_format.into())],
                 }),
@@ -358,52 +365,6 @@ fn view_matrix_bytes(initial_yaw_degrees: f32, elapsed_seconds: f32, size: Rende
     bytes
 }
 
-fn seed_from_clock() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
-
-struct SplitMix64 {
-    state: u64,
-}
-
-impl SplitMix64 {
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut value = self.state;
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        value ^ (value >> 31)
-    }
-
-    fn index(&mut self, length: usize) -> Result<usize, Box<dyn Error>> {
-        if length == 0 {
-            return Err("cannot choose from an empty panorama list".into());
-        }
-        let length = length as u64;
-        // Mirror the Web module's unbiased indexed selection rather than
-        // introducing modulo bias into the four panorama choices.
-        let acceptance_limit = u64::MAX - u64::MAX % length;
-        loop {
-            let value = self.next_u64();
-            if value < acceptance_limit {
-                return Ok((value % length) as usize);
-            }
-        }
-    }
-
-    fn unit_f32(&mut self) -> f32 {
-        // Match the Web module's effective 23-bit [0, 1) float precision.
-        (self.next_u64() as u32 >> 9) as f32 / (1_u32 << 23) as f32
-    }
-}
-
 const PANORAMA_SHADER: &str = r#"
 struct CameraUniforms {
     view: mat4x4<f32>,
@@ -435,15 +396,34 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
+fn srgb_to_linear(channel: f32) -> f32 {
+    if (channel <= 0.04045) {
+        return channel / 12.92;
+    }
+    return pow((channel + 0.055) / 1.055, 2.4);
+}
+
 @fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(panorama, panorama_sampler, input.beam);
+fn fs_srgb(input: VertexOutput) -> @location(0) vec4<f32> {
+    let webgl_color = textureSample(panorama, panorama_sampler, input.beam);
+    return vec4<f32>(
+        srgb_to_linear(webgl_color.r),
+        srgb_to_linear(webgl_color.g),
+        srgb_to_linear(webgl_color.b),
+        1.0,
+    );
+}
+
+@fragment
+fn fs_unorm(input: VertexOutput) -> @location(0) vec4<f32> {
+    let webgl_color = textureSample(panorama, panorama_sampler, input.beam);
+    return vec4<f32>(webgl_color.rgb, 1.0);
 }
 "#;
 
 #[cfg(test)]
 mod tests {
-    use super::{RenderSize, SOURCE_FACE_FOR_CUBEMAP_LAYER, view_matrix, view_matrix_bytes};
+    use super::{CUBEMAP_FORMAT, RenderSize, view_matrix, view_matrix_bytes};
 
     #[test]
     fn view_matrix_matches_the_captured_web_animation() {
@@ -462,13 +442,6 @@ mod tests {
     }
 
     #[test]
-    fn source_faces_follow_the_captured_webgl_cubemap_targets() {
-        // +X, -X, +Y, -Y, +Z, -Z respectively. The archive itself stores
-        // side faces as 0..=3 and vertical faces as 4 and 5.
-        assert_eq!(SOURCE_FACE_FOR_CUBEMAP_LAYER, [1, 3, 4, 5, 0, 2]);
-    }
-
-    #[test]
     fn uniforms_are_a_tightly_packed_column_major_mat4() {
         let bytes = view_matrix_bytes(
             0.0,
@@ -480,5 +453,10 @@ mod tests {
         );
         assert_eq!(&bytes[0..4], &1.0f32.to_ne_bytes());
         assert_eq!(&bytes[60..64], &1.0f32.to_ne_bytes());
+    }
+
+    #[test]
+    fn cubemap_filters_in_the_web_numeric_domain() {
+        assert_eq!(CUBEMAP_FORMAT, wgpu::TextureFormat::Rgba8Unorm);
     }
 }

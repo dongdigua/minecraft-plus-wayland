@@ -3,7 +3,7 @@ use std::error::Error;
 use rand::{Rng, RngCore, SeedableRng};
 use rand_hc::Hc128Rng;
 
-use super::{FrameInfo, Module, RenderContext, RenderSize};
+use super::{FrameInfo, Module, RenderContext, RenderSize, web_surface_fragment_entry};
 
 const GRASS_RESOURCE: &str = "grass/grass.png";
 const DIRT_RESOURCE: &str = "grass/dirt.png";
@@ -34,7 +34,7 @@ pub struct GrassModule {
 impl Default for GrassModule {
     fn default() -> Self {
         // This grid is replaced by the first configured output size.
-        let state = GrassState::new(3, 1, random_seed());
+        let state = GrassState::new(20, 1, 1, random_seed());
         Self {
             pipeline: None,
             bind_group_layout: None,
@@ -118,7 +118,11 @@ impl Module for GrassModule {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(web_surface_fragment_entry(
+                        context.surface_format,
+                        "fs_srgb",
+                        "fs_unorm",
+                    )),
                     compilation_options: Default::default(),
                     targets: &[Some(context.surface_format.into())],
                 }),
@@ -149,11 +153,19 @@ impl Module for GrassModule {
     }
 
     fn resize(&mut self, context: &RenderContext<'_>, size: RenderSize) {
-        let (columns, rows) = grid_dimensions(size);
-        if self.state.columns == columns && self.state.rows == rows {
+        let dimensions = grid_dimensions(size);
+        if self.state.allocated_columns == dimensions.allocated_columns
+            && self.state.visible_columns == dimensions.visible_columns
+            && self.state.rows == dimensions.rows
+        {
             return;
         }
-        self.state = GrassState::new(columns, rows, random_seed());
+        self.state = GrassState::new(
+            dimensions.allocated_columns,
+            dimensions.visible_columns,
+            dimensions.rows,
+            random_seed(),
+        );
         self.seed = self.state.shader_seed;
         self.recreate_grid_resources(context);
     }
@@ -194,7 +206,8 @@ impl Module for GrassModule {
             uniforms,
             0,
             &uniform_bytes(
-                self.state.columns,
+                self.state.allocated_columns,
+                self.state.visible_columns,
                 self.state.rows,
                 self.seed,
                 self.state.offset,
@@ -302,7 +315,8 @@ impl GrassModule {
 }
 
 struct GrassState {
-    columns: u32,
+    allocated_columns: u32,
+    visible_columns: u32,
     rows: u32,
     biomes: Vec<[f32; 2]>,
     last_bucket: Option<u64>,
@@ -315,15 +329,16 @@ struct GrassState {
 }
 
 impl GrassState {
-    fn new(columns: u32, rows: u32, seed: [u8; 32]) -> Self {
+    fn new(allocated_columns: u32, visible_columns: u32, rows: u32, seed: [u8; 32]) -> Self {
         let mut random = Hc128Rng::from_seed(seed);
-        let mut biomes = vec![[1.0, 1.0]; (columns * rows) as usize];
+        let mut biomes = vec![[1.0, 1.0]; (allocated_columns * rows) as usize];
         // The Web module begins with its left-hand working column as grass.
         for row in 0..rows {
             biomes[row as usize] = [0.0, 0.0];
         }
         Self {
-            columns,
+            allocated_columns,
+            visible_columns,
             rows,
             biomes,
             last_bucket: None,
@@ -349,10 +364,11 @@ impl GrassState {
         // once, rather than looping through all missed 25 ms buckets.
         self.last_bucket = Some(bucket);
 
-        let column = self.random.gen_range(1, self.columns);
+        let (first_column, column_end) = candidate_column_bounds(self.allocated_columns);
+        let column = self.random.gen_range(first_column, column_end);
         let row = self.random.gen_range(0, self.rows);
-        // In the Web state machine, candidates in the right half trigger a
-        // one-column recycle/scroll, but never more than once per second.
+        // In the Web state machine, candidates in the work area (column > 9)
+        // trigger a one-column recycle/scroll, but never more than once per second.
         let moves_view = column > 9;
         if moves_view && elapsed_seconds - self.last_shift <= 1.0 {
             return;
@@ -362,7 +378,7 @@ impl GrassState {
         let mut total = [0.0, 0.0];
         let mut count = 0.0;
         self.accumulate_neighbor(column - 1, row, &mut total, &mut count);
-        if column + 1 < self.columns {
+        if column + 1 < self.allocated_columns {
             self.accumulate_neighbor(column + 1, row, &mut total, &mut count);
         }
         if row > 0 {
@@ -471,10 +487,26 @@ fn load_texture(
     Ok(texture.create_view(&wgpu::TextureViewDescriptor::default()))
 }
 
-fn grid_dimensions(size: RenderSize) -> (u32, u32) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GridDimensions {
+    allocated_columns: u32,
+    visible_columns: u32,
+    rows: u32,
+}
+
+fn grid_dimensions(size: RenderSize) -> GridDimensions {
     let rows = size.height.max(1).div_ceil(TILE_PIXELS).max(1);
     let visible_columns = size.width.max(1).div_ceil(TILE_PIXELS).max(1);
-    (visible_columns + 2, rows)
+    let allocated_columns = 20.max(2 * visible_columns);
+    GridDimensions {
+        allocated_columns,
+        visible_columns,
+        rows,
+    }
+}
+
+fn candidate_column_bounds(allocated_columns: u32) -> (u32, u32) {
+    (1, allocated_columns)
 }
 
 fn uniform_layout_entry(
@@ -507,21 +539,24 @@ fn texture_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 fn uniform_bytes(
-    columns: u32,
+    allocated_columns: u32,
+    visible_columns: u32,
     rows: u32,
     seed: f32,
     offset: u32,
     time: f32,
     shift_start: f32,
 ) -> [u8; UNIFORM_BYTES as usize] {
+    // Eight scalar slots keep the WGSL uniform struct at 32 bytes while
+    // carrying both the storage width and the independent screen VP width.
     let values = [
-        columns as f32,
+        allocated_columns as f32,
+        visible_columns as f32,
         rows as f32,
         seed,
         offset as f32,
         time,
         shift_start,
-        0.0,
         0.0,
     ];
     let mut bytes = [0; UNIFORM_BYTES as usize];
@@ -548,13 +583,14 @@ fn random_seed() -> [u8; 32] {
 
 const GRASS_SHADER: &str = r#"
 struct ModuleUniforms {
-    columns: f32,
+    allocated_columns: f32,
+    visible_columns: f32,
     rows: f32,
     seed: f32,
     offset: f32,
     time: f32,
     shift_start: f32,
-    _padding: vec2<f32>,
+    _padding: f32,
 };
 
 struct VertexOutput {
@@ -594,8 +630,10 @@ fn vs_main(
     let s = sin(rotation);
     let c = cos(rotation);
     let position = positions[vertex_index] - vec2<f32>(0.5, 0.5);
-    let rotated = vec2<f32>(c * position.x - s * position.y,
-                            s * position.x + c * position.y) + vec2<f32>(0.5, 0.5);
+    // GLSL mat3 constructors are column-major. The Web shader's quarter-turn
+    // matrix therefore maps (x, y) to (c*x + s*y, -s*x + c*y).
+    let rotated = vec2<f32>(c * position.x + s * position.y,
+                            -s * position.x + c * position.y) + vec2<f32>(0.5, 0.5);
 
     var output: VertexOutput;
     // The captured Web state starts at shift_start = -1. Each recycled
@@ -604,7 +642,7 @@ fn vs_main(
     let grid_position = vec2<f32>(f32(column) - shift + rotated.x,
                                   f32(row) + rotated.y);
     output.position = vec4<f32>(
-        grid_position.x * 2.0 / (uniforms.columns - 2.0) - 1.0,
+        grid_position.x * 2.0 / uniforms.visible_columns - 1.0,
         grid_position.y * 2.0 / uniforms.rows - 1.0,
         0.0,
         1.0,
@@ -623,46 +661,108 @@ fn srgb_to_linear(channel: f32) -> f32 {
     return pow((channel + 0.055) / 1.055, 2.4);
 }
 
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    // The three source PNGs and WebGL texture sampling yield numeric sRGB
-    // values. The Wayland surface is sRGB, so encode the WebGL numeric result
-    // through its inverse transfer function before presentation.
-    var sampled: vec4<f32>;
+fn web_color(input: VertexOutput) -> vec4<f32> {
+    var tile: vec4<f32>;
     if (input.biome.x + input.biome.y <= 1.0) {
-        sampled = textureSample(grass_texture, nearest_sampler, input.uv);
+        tile = textureSample(grass_texture, nearest_sampler, input.uv);
     } else {
-        sampled = textureSample(dirt_texture, nearest_sampler, input.uv);
+        tile = textureSample(dirt_texture, nearest_sampler, input.uv);
     }
     // The source's biome pairs use the PNG's native lookup orientation:
     // `(1, 1)` must hit its neutral white corner so dirt keeps its brown RGB.
-    let webgl_color = sampled * textureSample(biome_colors, nearest_sampler, input.biome);
+    let biome = textureSample(biome_colors, nearest_sampler, input.biome);
+    return vec4<f32>(tile.rgb * biome.rgb, 1.0);
+}
+
+@fragment
+fn fs_srgb(input: VertexOutput) -> @location(0) vec4<f32> {
+    // Compute the complete Web numeric result before compensating for the
+    // surface target's automatic sRGB encode.
+    let color = web_color(input);
     return vec4<f32>(
         vec3<f32>(
-            srgb_to_linear(webgl_color.r),
-            srgb_to_linear(webgl_color.g),
-            srgb_to_linear(webgl_color.b),
+            srgb_to_linear(color.r),
+            srgb_to_linear(color.g),
+            srgb_to_linear(color.b),
         ),
-        // Both source textures are opaque in the original module and WebGL
-        // blending is disabled. Keep the Wayland wallpaper target opaque too.
         1.0,
     );
+}
+
+@fragment
+fn fs_unorm(input: VertexOutput) -> @location(0) vec4<f32> {
+    return web_color(input);
 }
 "#;
 
 #[cfg(test)]
 mod tests {
-    use super::{GrassState, RenderSize, UPDATE_PERIOD_SECONDS, grid_dimensions, is_grass};
+    use super::{
+        GrassState, GridDimensions, RenderSize, UNIFORM_BYTES, UPDATE_PERIOD_SECONDS,
+        candidate_column_bounds, grid_dimensions, is_grass, uniform_bytes,
+    };
+
+    fn glsl_column_major_rotation(position: [f32; 2], rotation: f32) -> [f32; 2] {
+        let (s, c) = rotation.sin_cos();
+        [
+            c * position[0] + s * position[1],
+            -s * position[0] + c * position[1],
+        ]
+    }
 
     #[test]
-    fn grid_has_one_left_and_one_right_working_column() {
-        assert_eq!(
-            grid_dimensions(RenderSize {
-                width: 1920,
-                height: 1080
-            }),
-            (18, 9)
-        );
+    fn pi_over_two_rotation_matches_glsl_column_major_mat3() {
+        let rotated = glsl_column_major_rotation([0.25, -0.5], std::f32::consts::FRAC_PI_2);
+        assert!((rotated[0] + 0.5).abs() < 1.0e-6);
+        assert!((rotated[1] + 0.25).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn grid_dimensions_match_web_allocation_strategy() {
+        for (width, visible_columns, allocated_columns) in
+            [(800, 7, 20), (960, 8, 20), (1280, 11, 22), (1920, 16, 32)]
+        {
+            assert_eq!(
+                grid_dimensions(RenderSize {
+                    width,
+                    height: 1080,
+                }),
+                GridDimensions {
+                    allocated_columns,
+                    visible_columns,
+                    rows: 9,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_range_reaches_the_allocated_work_area() {
+        for allocated_columns in [20, 22, 32] {
+            let (start, end) = candidate_column_bounds(allocated_columns);
+            assert_eq!(start, 1);
+            assert_eq!(end, allocated_columns);
+            assert!(start <= 10 && 10 < end, "column > 9 must be reachable");
+            assert_eq!(end - 1, allocated_columns - 1);
+        }
+    }
+
+    #[test]
+    fn state_storage_uses_allocated_columns() {
+        let state = GrassState::new(22, 11, 9, [3; 32]);
+        assert_eq!(state.biomes.len(), 22 * 9);
+        assert_eq!(state.visible_columns, 11);
+    }
+
+    #[test]
+    fn uniforms_keep_the_32_byte_wgsl_scalar_layout() {
+        let bytes = uniform_bytes(32, 16, 9, 0.25, 3, 4.5, 2.5);
+        assert_eq!(bytes.len(), UNIFORM_BYTES as usize);
+        let values = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, [32.0, 16.0, 9.0, 0.25, 3.0, 4.5, 2.5, 0.0]);
     }
 
     #[test]
@@ -673,7 +773,7 @@ mod tests {
 
     #[test]
     fn delayed_time_does_not_catch_up_multiple_buckets() {
-        let mut state = GrassState::new(18, 9, [1; 32]);
+        let mut state = GrassState::new(18, 16, 9, [1; 32]);
         state.advance(0.0);
         let after_first = state.last_bucket;
         state.advance(UPDATE_PERIOD_SECONDS * 100.0);
@@ -683,7 +783,7 @@ mod tests {
 
     #[test]
     fn recycling_a_column_preserves_the_world_rotation_coordinate() {
-        let mut state = GrassState::new(4, 2, [2; 32]);
+        let mut state = GrassState::new(4, 2, 2, [2; 32]);
         state.biomes = vec![
             [0.0, 0.0],
             [0.1, 0.0], // column 0
