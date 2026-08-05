@@ -8,7 +8,9 @@ default = []
 embed-assets = []
 
 [dependencies]
+env_logger = { version = "0.11.8", default-features = false }
 image = { version = "0.25.8", default-features = false, features = ["png"] }
+log = "0.4.27"
 obj = "0.10.2"
 pollster = "0.4"
 # Match the Web WASM's rand 0.6 / HC-128 random stream rather than using

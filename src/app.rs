@@ -447,7 +447,7 @@ impl LayerShellHandler for App {
         _serial: u32,
     ) {
         if let Err(error) = self.configure_layer(configure, qh) {
-            eprintln!("failed to configure layer surface: {error}");
+            log::error!("failed to configure layer surface: {error}");
             self.exit = true;
         }
     }
@@ -474,7 +474,7 @@ impl SessionLockHandler for App {
         _serial: u32,
     ) {
         if let Err(error) = self.configure_lock(&surface, configure, qh) {
-            eprintln!("failed to configure session-lock surface: {error}");
+            log::error!("failed to configure session-lock surface: {error}");
             self.exit = true;
         }
     }
@@ -523,7 +523,7 @@ impl CompositorHandler for App {
         }
 
         if let Err(error) = self.render_surface(surface, qh) {
-            eprintln!("rendering stopped: {error}");
+            log::error!("rendering stopped: {error}");
             self.exit = true;
         }
     }

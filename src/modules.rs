@@ -179,11 +179,17 @@ pub(super) fn web_surface_fragment_entry(
     srgb_entry: &'static str,
     unorm_entry: &'static str,
 ) -> &'static str {
-    if surface_format.is_srgb() {
+    let entry = if surface_format.is_srgb() {
         srgb_entry
     } else {
         unorm_entry
-    }
+    };
+    log::debug!(
+        target: "minecraft_plus_wayland::surface",
+        "Web numeric RGB output: surface_format={surface_format:?}, is_srgb={}, fragment_entry={entry}",
+        surface_format.is_srgb(),
+    );
+    entry
 }
 
 #[cfg(test)]

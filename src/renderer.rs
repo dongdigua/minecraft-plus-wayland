@@ -131,6 +131,19 @@ impl Renderer {
         {
             config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
         }
+        log::debug!(
+            target: "minecraft_plus_wayland::surface",
+            "wgpu surface configure: size={}x{}, format={:?}, is_srgb={}, color_space={:?}, \
+             alpha_mode={:?}, present_mode={:?}, available_formats={:?}",
+            config.width,
+            config.height,
+            config.format,
+            config.format.is_srgb(),
+            config.color_space,
+            config.alpha_mode,
+            config.present_mode,
+            capabilities.formats,
+        );
         self.surface.configure(&self.device, &config);
         self.config = Some(config);
         Ok(())

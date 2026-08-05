@@ -82,9 +82,30 @@ pub(crate) fn load_web_wasm() -> Result<Vec<u8>, Box<dyn Error>> {
     );
 
     match source {
-        AssetSource::Path(path) => fs::read(&path)
-            .map_err(|error| source_io_error(WEB_WASM_ENV, &path, "read Web WASM", error).into()),
-        AssetSource::Embedded(bytes) => Ok(bytes.to_vec()),
+        AssetSource::Path(path) => {
+            log::debug!(
+                target: "minecraft_plus_wayland::wasm",
+                "loading Web WASM from path {}",
+                path.display(),
+            );
+            let bytes = fs::read(&path)
+                .map_err(|error| source_io_error(WEB_WASM_ENV, &path, "read Web WASM", error))?;
+            log::debug!(
+                target: "minecraft_plus_wayland::wasm",
+                "loaded Web WASM: source={}, bytes={}",
+                path.display(),
+                bytes.len(),
+            );
+            Ok(bytes)
+        }
+        AssetSource::Embedded(bytes) => {
+            log::debug!(
+                target: "minecraft_plus_wayland::wasm",
+                "using embedded Web WASM: bytes={}",
+                bytes.len(),
+            );
+            Ok(bytes.to_vec())
+        }
     }
 }
 

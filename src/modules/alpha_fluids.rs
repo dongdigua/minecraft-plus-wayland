@@ -205,6 +205,11 @@ impl Module for AlphaFluidsModule {
         self.bind_group = Some(bind_group);
         self.uniforms = Some(uniforms);
         self.textures = Some(FluidTextures { still, flowing });
+        log::debug!(
+            target: "minecraft_plus_wayland::wasm",
+            "initializing alpha-fluid WASM runtime: variant={:?}",
+            self.variant,
+        );
         match self.variant {
             AlphaFluidVariant::Water => {
                 self.water_runtime = Some(OriginalWaterRuntime::new()?);
@@ -231,6 +236,11 @@ impl Module for AlphaFluidsModule {
         // Web advances at most once when it observes a new 50 ms bucket. A
         // compositor time jump therefore performs one current update and
         // discards every unobserved intermediate bucket.
+        log::trace!(
+            target: "minecraft_plus_wayland::wasm",
+            "stepping alpha-fluid WASM runtime: variant={:?}, observed_bucket={tick}",
+            self.variant,
+        );
         let texels = match self.variant {
             AlphaFluidVariant::Water => self
                 .water_runtime
@@ -673,6 +683,12 @@ impl OriginalLavaRuntime {
         // The Web state at p0 + 4100 gates its / -3 scrolling counter. It is
         // clear for still and set for flowing.
         memory.write(&mut store, (flowing_state as usize) + 4100, &[1])?;
+        log::debug!(
+            target: "minecraft_plus_wayland::wasm",
+            "lava WASM runtime ready: function_index={LAVA_STEP_FUNCTION}, export={LAVA_STEP_EXPORT}, \
+             still_state={still_state}, flowing_state={flowing_state}, still_pixels={still_pixels}, \
+             flowing_pixels={flowing_pixels}",
+        );
 
         Ok(Self {
             store,
@@ -688,6 +704,10 @@ impl OriginalLavaRuntime {
     pub(super) fn tick(
         &mut self,
     ) -> Result<([u8; PIXEL_BYTES], [u8; PIXEL_BYTES]), Box<dyn Error>> {
+        log::trace!(
+            target: "minecraft_plus_wayland::wasm",
+            "calling lava WASM step twice for still/flowing rasters",
+        );
         self.step.call(
             &mut self.store,
             (self.still_state, self.still_pixels, PIXEL_BYTES as i32),
@@ -752,6 +772,13 @@ impl OriginalWaterRuntime {
         ] {
             memory.write(&mut store, state as usize + offset, &value.to_le_bytes())?;
         }
+        log::debug!(
+            target: "minecraft_plus_wayland::wasm",
+            "water WASM runtime ready: function_index={WATER_STEP_FUNCTION}, export={WATER_STEP_EXPORT}, \
+             state={state}, pixels={pixels}, raster={}x{} RGBA8",
+            GRID_SIZE,
+            GRID_SIZE,
+        );
         Ok(Self {
             store,
             step,
@@ -766,8 +793,13 @@ impl OriginalWaterRuntime {
     ) -> Result<([u8; PIXEL_BYTES], [u8; PIXEL_BYTES]), Box<dyn Error>> {
         self.tick += 1;
         self.store.data_mut().uploads.clear();
-        self.step
-            .call(&mut self.store, (self.state, self.tick as f64 * 0.05))?;
+        let wasm_time = self.tick as f64 * 0.05;
+        log::trace!(
+            target: "minecraft_plus_wayland::wasm",
+            "calling water WASM step: internal_tick={}, time={wasm_time:.3}",
+            self.tick,
+        );
+        self.step.call(&mut self.store, (self.state, wasm_time))?;
         let uploads = &self.store.data().uploads;
         match uploads.len() {
             0 if self.last_uploads.is_some() => {
@@ -780,7 +812,15 @@ impl OriginalWaterRuntime {
                     "original Web water function produced no initial texture uploads".into(),
                 );
             }
-            2 => self.last_uploads = Some((uploads[0], uploads[1])),
+            2 => {
+                if self.last_uploads.is_none() {
+                    log::debug!(
+                        target: "minecraft_plus_wayland::wasm",
+                        "captured initial water WASM rasters: uploads=2, bytes_per_raster={PIXEL_BYTES}",
+                    );
+                }
+                self.last_uploads = Some((uploads[0], uploads[1]));
+            }
             count => {
                 return Err(format!(
                     "original Web water function produced {count} texture uploads, expected 0 or 2"
@@ -820,6 +860,13 @@ fn define_web_import_stubs(
             _ => ImportBehavior::Stub,
         };
         let import_name = import.name().to_owned();
+        if !matches!(behavior, ImportBehavior::Stub) {
+            log::debug!(
+                target: "minecraft_plus_wayland::wasm",
+                "binding Web WASM host import: {}::{import_name}",
+                import.module(),
+            );
+        }
         linker.func_new(
             import.module(),
             import.name(),
@@ -882,6 +929,12 @@ fn capture_texture_upload(
     debug_assert_eq!(length, PIXEL_BYTES);
     let mut upload = [0; PIXEL_BYTES];
     memory.read(&*caller, pointer, &mut upload)?;
+    log::trace!(
+        target: "minecraft_plus_wayland::wasm",
+        "captured WebGL texture upload from WASM: pointer={pointer}, length={length}, size={}x{}",
+        GRID_SIZE,
+        GRID_SIZE,
+    );
     caller.data_mut().uploads.push(upload);
     Ok(())
 }
@@ -902,6 +955,10 @@ fn fill_guest_entropy(
     let (memory, pointer, length) = checked_guest_range(caller, params, 1, 2, import_name)?;
     let bytes = caller.data_mut().entropy(length);
     memory.write(&mut *caller, pointer, &bytes)?;
+    log::debug!(
+        target: "minecraft_plus_wayland::wasm",
+        "filled Web WASM entropy import: import={import_name}, pointer={pointer}, length={length}",
+    );
     #[cfg(test)]
     caller.data_mut().entropy_writes.push((pointer, bytes));
     Ok(())
@@ -981,6 +1038,13 @@ fn export_internal_function(
             write_uleb(&mut patched, payload.len() as u32);
             patched.extend_from_slice(&payload);
             patched.extend_from_slice(&wasm[payload_end..]);
+            log::debug!(
+                target: "minecraft_plus_wayland::wasm",
+                "patched Web WASM export section: export={export_name}, function_index={function_index}, \
+                 original_bytes={}, patched_bytes={}",
+                wasm.len(),
+                patched.len(),
+            );
             return Ok(patched);
         }
         cursor = payload_end;
