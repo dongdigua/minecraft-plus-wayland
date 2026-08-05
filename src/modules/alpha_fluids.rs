@@ -1,4 +1,4 @@
-use std::{error::Error, fs, path::Path};
+use std::error::Error;
 
 use wasmi::{Engine, ExternType, Linker, Memory, Module as WasmModule, Store, Val};
 
@@ -580,7 +580,6 @@ mod tests {
     }
 }
 
-const WEB_WASM: &str = "assets/mcse_web_bg.wasm";
 const STATE_BYTES: usize = 4_104;
 const PIXEL_BYTES: usize = 1_024;
 const LAVA_STEP_FUNCTION: u32 = 143;
@@ -611,13 +610,7 @@ pub(super) struct OriginalLavaRuntime {
 
 impl OriginalLavaRuntime {
     pub(super) fn new() -> Result<Self, Box<dyn Error>> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(WEB_WASM);
-        let wasm = fs::read(&path).map_err(|error| {
-            format!(
-                "could not read original Web WASM at {}: {error}",
-                path.display()
-            )
-        })?;
+        let wasm = crate::resources::load_web_wasm()?;
         let wasm = export_internal_function(&wasm, LAVA_STEP_EXPORT, LAVA_STEP_FUNCTION)?;
 
         let engine = Engine::default();
@@ -720,8 +713,7 @@ pub(super) struct OriginalWaterRuntime {
 
 impl OriginalWaterRuntime {
     pub(super) fn new() -> Result<Self, Box<dyn Error>> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(WEB_WASM);
-        let wasm = fs::read(&path)?;
+        let wasm = crate::resources::load_web_wasm()?;
         let wasm = export_internal_function(&wasm, WATER_STEP_EXPORT, WATER_STEP_FUNCTION)?;
         let engine = Engine::default();
         let module = WasmModule::new(&engine, &wasm[..])?;
@@ -903,13 +895,12 @@ fn write_uleb(bytes: &mut Vec<u8>, mut value: u32) {
 mod wasm_runtime_tests {
     use super::{
         LAVA_STEP_EXPORT, LAVA_STEP_FUNCTION, OriginalLavaRuntime, OriginalWaterRuntime,
-        PIXEL_BYTES, WEB_WASM, export_internal_function,
+        PIXEL_BYTES, export_internal_function,
     };
-    use std::{fs, path::Path};
 
     #[test]
     fn internal_export_patch_preserves_the_original_and_adds_one_export() {
-        let wasm = fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join(WEB_WASM)).unwrap();
+        let wasm = crate::resources::load_web_wasm().unwrap();
         let patched =
             export_internal_function(&wasm, LAVA_STEP_EXPORT, LAVA_STEP_FUNCTION).unwrap();
         assert!(patched.len() > wasm.len());

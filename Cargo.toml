@@ -3,6 +3,10 @@ name = "minecraft-plus-wayland"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+embed-assets = []
+
 [dependencies]
 image = { version = "0.25.8", default-features = false, features = ["png"] }
 obj = "0.10.2"
