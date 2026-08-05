@@ -70,7 +70,7 @@ impl AlphaFluidsModule {
         let message = format!("alpha-fluid WASM {stage} fault: {error}");
         log::error!(
             target: "minecraft_plus_wayland::wasm",
-            "{message}; disabling the runtime and rendering black",
+            "{message}; disabling the runtime and rendering fault blue #0078D7",
         );
         self.fault = Some(message);
         self.water_runtime = None;
@@ -240,8 +240,8 @@ impl Module for AlphaFluidsModule {
         }
         // The first frame's update performs the first and only initial WASM
         // step. No synthetic raster is uploaded while runtime_texels is None.
-        // Runtime initialization failure is a fail-closed black frame rather
-        // than an error that can tear down a session-lock surface.
+        // Runtime initialization failure is a fail-closed opaque #0078D7
+        // frame rather than an error that can tear down a session-lock surface.
         Ok(())
     }
 
@@ -300,13 +300,13 @@ impl Module for AlphaFluidsModule {
     ) {
         if self.fault.is_some() {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("alpha-fluids fault black frame"),
+                label: Some("alpha-fluids fault blue frame"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: target,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(alpha_fluid_fault_color(context.surface_format)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -484,6 +484,29 @@ fn advance_observed_bucket(last_tick: &mut Option<u64>, tick: u64) -> bool {
     true
 }
 
+fn alpha_fluid_fault_color(surface_format: wgpu::TextureFormat) -> wgpu::Color {
+    fn srgb_to_linear(channel: f64) -> f64 {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    let web_numeric = [0.0, 0x78 as f64 / 255.0, 0xD7 as f64 / 255.0];
+    let output = if surface_format.is_srgb() {
+        web_numeric.map(srgb_to_linear)
+    } else {
+        web_numeric
+    };
+    wgpu::Color {
+        r: output[0],
+        g: output[1],
+        b: output[2],
+        a: 1.0,
+    }
+}
+
 /// The captured column-major WebGL matrix, generalized for the native surface
 /// size. `vs_main` maps its OpenGL [-w,w] Z coordinate to WebGPU [0,w].
 fn alpha_fluids_mvp(size: RenderSize) -> [f32; 16] {
@@ -622,7 +645,7 @@ fn fs_unorm(input: VertexOutput) -> @location(0) vec4<f32> {
 mod tests {
     use super::{
         AlphaFluidVariant, AlphaFluidsModule, GRID_SIZE, RenderSize, advance_observed_bucket,
-        alpha_fluids_mvp, matrix_bytes,
+        alpha_fluid_fault_color, alpha_fluids_mvp, matrix_bytes,
     };
 
     #[test]
@@ -636,6 +659,33 @@ mod tests {
 
         assert_eq!(steps, 4);
         assert_eq!(last_tick, Some(75_000));
+    }
+
+    #[test]
+    fn fault_blue_preserves_web_numeric_0078d7_on_both_surface_encodings() {
+        let unorm = alpha_fluid_fault_color(wgpu::TextureFormat::Rgba8Unorm);
+        assert_eq!(
+            [unorm.r, unorm.g, unorm.b],
+            [0.0, 120.0 / 255.0, 215.0 / 255.0]
+        );
+        assert_eq!(unorm.a, 1.0);
+
+        let srgb = alpha_fluid_fault_color(wgpu::TextureFormat::Rgba8UnormSrgb);
+        fn linear_to_srgb(channel: f64) -> f64 {
+            if channel <= 0.003_130_8 {
+                channel * 12.92
+            } else {
+                1.055 * channel.powf(1.0 / 2.4) - 0.055
+            }
+        }
+        for (linear, expected) in [
+            (srgb.r, 0.0),
+            (srgb.g, 120.0 / 255.0),
+            (srgb.b, 215.0 / 255.0),
+        ] {
+            assert!((linear_to_srgb(linear) - expected).abs() < 1.0e-12);
+        }
+        assert_eq!(srgb.a, 1.0);
     }
 
     #[test]

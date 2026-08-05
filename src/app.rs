@@ -1,5 +1,6 @@
 use std::{env, error::Error, time::Instant};
 
+use rand::Rng;
 use smithay_client_toolkit::reexports::client::{
     Connection, QueueHandle,
     globals::registry_queue_init,
@@ -32,7 +33,7 @@ use crate::{
     modules::{
         AlphaFluidVariant, AlphaFluidsModule, BlocksModule, CreeperModule, DvdBounceModule,
         DvdBounceVariant, FootprintModule, FrameInfo, GrassModule, ItemBounceModule, ItemPopModule,
-        LoadCubeModule, Module, PanoramaModule, RenderSize, SquidModule, TriangleModule,
+        LoadCubeModule, Module, PanoramaModule, RenderSize, SquidModule,
     },
     renderer::{RenderOutcome, Renderer},
 };
@@ -50,7 +51,6 @@ enum StartupMode {
 
 #[derive(Clone, Copy, Debug)]
 enum ModuleSelection {
-    Triangle,
     LoadCube,
     ItemPop,
     ItemBounce,
@@ -65,9 +65,45 @@ enum ModuleSelection {
 }
 
 impl ModuleSelection {
+    fn from_id(module_id: u8) -> Option<Self> {
+        Some(match module_id {
+            0 => Self::LoadCube,
+            1 => Self::DvdBounce(DvdBounceVariant::Trail),
+            2 => Self::DvdBounce(DvdBounceVariant::Direct),
+            3 => Self::ItemPop,
+            4 => Self::AlphaFluids(AlphaFluidVariant::Water),
+            5 => Self::AlphaFluids(AlphaFluidVariant::Lava),
+            6 => Self::Panorama,
+            7 => Self::Footprint,
+            8 => Self::Squid,
+            9 => Self::ItemBounce,
+            10 => Self::Grass,
+            11 => Self::Blocks,
+            12 => Self::Creeper,
+            _ => return None,
+        })
+    }
+
+    fn id(self) -> u8 {
+        match self {
+            Self::LoadCube => 0,
+            Self::DvdBounce(DvdBounceVariant::Trail) => 1,
+            Self::DvdBounce(DvdBounceVariant::Direct) => 2,
+            Self::ItemPop => 3,
+            Self::AlphaFluids(AlphaFluidVariant::Water) => 4,
+            Self::AlphaFluids(AlphaFluidVariant::Lava) => 5,
+            Self::Panorama => 6,
+            Self::Footprint => 7,
+            Self::Squid => 8,
+            Self::ItemBounce => 9,
+            Self::Grass => 10,
+            Self::Blocks => 11,
+            Self::Creeper => 12,
+        }
+    }
+
     fn create(self) -> Box<dyn Module> {
         match self {
-            Self::Triangle => Box::<TriangleModule>::default(),
             Self::LoadCube => Box::<LoadCubeModule>::default(),
             Self::ItemPop => Box::<ItemPopModule>::default(),
             Self::ItemBounce => Box::<ItemBounceModule>::default(),
@@ -193,7 +229,7 @@ fn parse_options(
     arguments: impl IntoIterator<Item = String>,
 ) -> Result<StartupOptions, Box<dyn Error>> {
     let mut mode = StartupMode::LayerShell;
-    let mut module = ModuleSelection::Triangle;
+    let mut module = None;
     let mut arguments = arguments.into_iter();
 
     while let Some(argument) = arguments.next() {
@@ -205,31 +241,13 @@ fn parse_options(
                     .ok_or("--module requires a module number")?
                     .parse::<u8>()
                     .map_err(|_| "--module requires an integer module number")?;
-                module = match module_id {
-                    0 => ModuleSelection::LoadCube,
-                    1 => ModuleSelection::DvdBounce(DvdBounceVariant::Trail),
-                    2 => ModuleSelection::DvdBounce(DvdBounceVariant::Direct),
-                    3 => ModuleSelection::ItemPop,
-                    4 => ModuleSelection::AlphaFluids(AlphaFluidVariant::Water),
-                    5 => ModuleSelection::AlphaFluids(AlphaFluidVariant::Lava),
-                    6 => ModuleSelection::Panorama,
-                    7 => ModuleSelection::Footprint,
-                    8 => ModuleSelection::Squid,
-                    9 => ModuleSelection::ItemBounce,
-                    10 => ModuleSelection::Grass,
-                    11 => ModuleSelection::Blocks,
-                    12 => ModuleSelection::Creeper,
-                    _ => {
-                        return Err(format!(
-                            "module={module_id} is outside the valid range 0..=12"
-                        )
-                        .into());
-                    }
-                };
+                module = Some(ModuleSelection::from_id(module_id).ok_or_else(|| {
+                    format!("module={module_id} is outside the valid range 0..=12")
+                })?);
             }
             "--help" | "-h" => {
                 return Err(
-                    "Usage: minecraft-plus-wayland [--lock] [--module <n>]\n\n--module 0 selects Web module=0 (load cube); --module 1 selects module=1 (dvd bounce trail); --module 2 selects module=2 (dvd bounce direct); --module 3 selects module=3 (item pop); --module 4 selects module=4 (alpha fluids water); --module 5 selects module=5 (alpha fluids lava); --module 6 selects module=6 (panorama); --module 7 selects module=7 (footprint); --module 8 selects module=8 (squid); --module 9 selects module=9 (item bounce); --module 10 selects module=10 (grass); --module 11 selects module=11 (blocks); --module 12 selects module=12 (creeper)."
+                    "Usage: minecraft-plus-wayland [--lock] [--module <n>]\n\nWithout --module, one of the 13 Web modules is selected randomly at startup. --module 0 selects Web module=0 (load cube); --module 1 selects module=1 (dvd bounce trail); --module 2 selects module=2 (dvd bounce direct); --module 3 selects module=3 (item pop); --module 4 selects module=4 (alpha fluids water); --module 5 selects module=5 (alpha fluids lava); --module 6 selects module=6 (panorama); --module 7 selects module=7 (footprint); --module 8 selects module=8 (squid); --module 9 selects module=9 (item bounce); --module 10 selects module=10 (grass); --module 11 selects module=11 (blocks); --module 12 selects module=12 (creeper)."
                         .into(),
                 );
             }
@@ -241,6 +259,18 @@ fn parse_options(
             }
         }
     }
+
+    let module = module.unwrap_or_else(|| {
+        let module_id = rand::thread_rng().gen_range(0, 13);
+        let selection = ModuleSelection::from_id(module_id)
+            .expect("random module id must remain inside the 13-entry module table");
+        log::info!(
+            target: "minecraft_plus_wayland::startup",
+            "no --module argument supplied; randomly selected module={}",
+            selection.id(),
+        );
+        selection
+    });
 
     Ok(StartupOptions { mode, module })
 }
