@@ -43,7 +43,7 @@ pub enum LockVisual {
     },
     DissolvingCreeper {
         attempt: AttemptId,
-        frozen_approach: Duration,
+        approach_started_at: Instant,
         started_at: Instant,
     },
     FatalBlack,
@@ -90,7 +90,7 @@ enum Phase {
     },
     Authenticated {
         attempt: AttemptId,
-        frozen_approach: Duration,
+        approach_started_at: Instant,
         started_at: Instant,
     },
     UnlockRequested,
@@ -223,9 +223,7 @@ impl LockState {
             AuthDecision::Authenticated => {
                 self.phase = Phase::Authenticated {
                     attempt,
-                    frozen_approach: now
-                        .saturating_duration_since(approach_started_at)
-                        .min(CREEPER_APPROACH_DURATION),
+                    approach_started_at,
                     started_at: now,
                 };
             }
@@ -335,11 +333,11 @@ impl LockState {
             },
             Phase::Authenticated {
                 attempt,
-                frozen_approach,
+                approach_started_at,
                 started_at,
             } => LockVisual::DissolvingCreeper {
                 attempt,
-                frozen_approach,
+                approach_started_at,
                 started_at,
             },
             Phase::Fatal => LockVisual::FatalBlack,
@@ -477,7 +475,7 @@ mod tests {
             state.visual(authenticated_at),
             LockVisual::DissolvingCreeper {
                 attempt,
-                frozen_approach: Duration::from_millis(200),
+                approach_started_at,
                 started_at: authenticated_at,
             }
         );
@@ -508,20 +506,27 @@ mod tests {
     }
 
     #[test]
-    fn late_success_freezes_creeper_at_the_completed_approach() {
-        let started_at = Instant::now();
-        let authenticated_at = started_at + Duration::from_secs(2);
-        let mut state = LockState::new();
-        state.compositor_locked();
-        let attempt = state.begin_authentication(started_at).unwrap();
-        state.authentication_result(attempt, AuthDecision::Authenticated, authenticated_at);
-        assert!(matches!(
-            state.visual(authenticated_at),
-            LockVisual::DissolvingCreeper {
-                frozen_approach: CREEPER_APPROACH_DURATION,
-                ..
-            }
-        ));
+    fn success_preserves_the_independent_approach_timeline() {
+        let approach_started_at = Instant::now();
+        for authenticated_after in [
+            Duration::ZERO,
+            Duration::from_millis(200),
+            Duration::from_secs(2),
+        ] {
+            let authenticated_at = approach_started_at + authenticated_after;
+            let mut state = LockState::new();
+            state.compositor_locked();
+            let attempt = state.begin_authentication(approach_started_at).unwrap();
+            state.authentication_result(attempt, AuthDecision::Authenticated, authenticated_at);
+            assert_eq!(
+                state.visual(authenticated_at),
+                LockVisual::DissolvingCreeper {
+                    attempt,
+                    approach_started_at,
+                    started_at: authenticated_at,
+                }
+            );
+        }
     }
 
     #[test]
@@ -539,7 +544,7 @@ mod tests {
         let attempt = AttemptId::new(7);
         let dissolving = LockVisual::DissolvingCreeper {
             attempt,
-            frozen_approach: CREEPER_APPROACH_DURATION,
+            approach_started_at: started_at,
             started_at,
         };
         assert!(dissolving.wants_continuous_frames(started_at + DISSOLVE_DURATION));

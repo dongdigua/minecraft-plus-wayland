@@ -222,11 +222,14 @@ impl CreeperAnimation {
                 true,
             ),
             LockVisual::DissolvingCreeper {
-                frozen_approach,
+                approach_started_at,
                 started_at,
                 ..
             } => (
-                normalized_progress(frozen_approach, CREEPER_APPROACH_DURATION),
+                normalized_progress(
+                    frame_time.saturating_duration_since(approach_started_at),
+                    CREEPER_APPROACH_DURATION,
+                ),
                 normalized_progress(
                     frame_time.saturating_duration_since(started_at),
                     DISSOLVE_DURATION,
@@ -355,6 +358,13 @@ mod tests {
             normalized_progress(CREEPER_APPROACH_DURATION * 2, CREEPER_APPROACH_DURATION),
             1.0
         );
+    }
+
+    #[test]
+    fn instant_success_approaches_while_the_first_half_dissolves() {
+        let elapsed = CREEPER_APPROACH_DURATION;
+        assert_eq!(normalized_progress(elapsed, CREEPER_APPROACH_DURATION), 1.0);
+        assert_eq!(normalized_progress(elapsed, DISSOLVE_DURATION), 0.5);
     }
 
     #[test]
