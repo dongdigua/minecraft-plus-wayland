@@ -9,7 +9,7 @@ use smithay_client_toolkit::reexports::client::{
 };
 
 use crate::{
-    lock::{animations::TriangleAnimation, state::LockVisual},
+    lock::{animations::LockAnimation, state::LockVisual},
     modules::{FrameInfo, Module, RenderContext, RenderSize},
 };
 
@@ -170,7 +170,7 @@ impl Renderer {
         &mut self,
         module: &mut dyn Module,
         frame: FrameInfo,
-        lock_overlay: Option<(&mut TriangleAnimation, LockVisual)>,
+        lock_overlay: Option<(&mut LockAnimation, LockVisual)>,
     ) -> RendererResult<RenderOutcome> {
         let Some(config) = self.config.as_ref() else {
             return Ok(RenderOutcome::Skipped);
@@ -213,7 +213,7 @@ impl Renderer {
         let context = self.context();
         module.render(&context, &mut encoder, &view, frame);
         if let Some((overlay, visual)) = lock_overlay {
-            overlay.draw(&context, &mut encoder, &view, visual);
+            overlay.draw(&context, &mut encoder, &view, frame.size, visual);
         }
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(surface_texture);

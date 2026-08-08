@@ -7,14 +7,26 @@ use std::{
 
 const RESOURCES_ARCHIVE_ENV: &str = "MINECRAFT_PLUS_RESOURCES";
 const WEB_WASM_ENV: &str = "MINECRAFT_PLUS_WEB_WASM";
-const DEFAULT_RESOURCES_ARCHIVE: &str = "assets/resources.zip";
-const DEFAULT_WEB_WASM: &str = "assets/mcse_web_bg.wasm";
+const ASSETS_ROOT_ENV: &str = "MINECRAFT_PLUS_ASSETS";
+const RESOURCES_ARCHIVE_RELATIVE: &str = "resources.zip";
+const WEB_WASM_RELATIVE: &str = "mcse_web_bg.wasm";
+const TORCH_ASSETS_RELATIVE: &str = "lock/torch";
 
 #[cfg(feature = "embed-assets")]
 const EMBEDDED_ARCHIVE: &[u8] = include_bytes!("../assets/resources.zip");
 #[cfg(feature = "embed-assets")]
 const EMBEDDED_WEB_WASM: &[u8] = include_bytes!("../assets/mcse_web_bg.wasm");
 
+#[cfg(feature = "embed-assets")]
+const EMBEDDED_TORCH_TEXTURES: [&[u8]; 5] = [
+    include_bytes!("../assets/lock/torch/redstone_torch.png"),
+    include_bytes!("../assets/lock/torch/copper_torch.png"),
+    include_bytes!("../assets/lock/torch/soul_torch.png"),
+    include_bytes!("../assets/lock/torch/torch.png"),
+    include_bytes!("../assets/lock/torch/smooth_stone.png"),
+];
+
+#[derive(Clone)]
 enum AssetSource {
     Path(PathBuf),
     Embedded(&'static [u8]),
@@ -24,8 +36,9 @@ enum AssetSource {
 fn load_resource(resource_name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     let source = select_source(
         configured_path(RESOURCES_ARCHIVE_ENV),
+        configured_asset_path(RESOURCES_ARCHIVE_RELATIVE),
         embedded_archive(),
-        DEFAULT_RESOURCES_ARCHIVE,
+        RESOURCES_ARCHIVE_RELATIVE,
     );
 
     match source {
@@ -54,10 +67,9 @@ where
 
 /// Decode a PNG from the original resource archive at runtime.
 ///
-/// `MINECRAFT_PLUS_RESOURCES` can point at an alternate `resources.zip` and
-/// takes precedence over an archive embedded with the `embed-assets` feature.
-/// Without either source, `assets/resources.zip` is resolved relative to the
-/// current working directory.
+/// `MINECRAFT_PLUS_RESOURCES` can point at an alternate `resources.zip`; otherwise
+/// `MINECRAFT_PLUS_ASSETS` can select an entire assets root. Both take precedence over an archive
+/// embedded with the `embed-assets` feature and the current-directory `assets` fallback.
 pub(crate) fn load_rgba_png(resource_name: &str) -> Result<image::RgbaImage, Box<dyn Error>> {
     let encoded = load_resource(resource_name)?;
     Ok(image::load_from_memory_with_format(&encoded, image::ImageFormat::Png)?.to_rgba8())
@@ -70,15 +82,14 @@ pub(crate) fn load_utf8(resource_name: &str) -> Result<String, Box<dyn Error>> {
 
 /// Read the original Web WASM used by the alpha-fluid modules.
 ///
-/// `MINECRAFT_PLUS_WEB_WASM` takes precedence over a module embedded with the
-/// `embed-assets` feature. Without either source,
-/// `assets/mcse_web_bg.wasm` is resolved relative to the current working
-/// directory.
+/// `MINECRAFT_PLUS_WEB_WASM` takes precedence, followed by `MINECRAFT_PLUS_ASSETS`, an embedded
+/// module, and the current-directory `assets` fallback.
 pub(crate) fn load_web_wasm() -> Result<Vec<u8>, Box<dyn Error>> {
     let source = select_source(
         configured_path(WEB_WASM_ENV),
+        configured_asset_path(WEB_WASM_RELATIVE),
         embedded_web_wasm(),
-        DEFAULT_WEB_WASM,
+        WEB_WASM_RELATIVE,
     );
 
     match source {
@@ -109,21 +120,65 @@ pub(crate) fn load_web_wasm() -> Result<Vec<u8>, Box<dyn Error>> {
     }
 }
 
+/// Load the five fixed torch-scene texture layers in redstone/copper/soul/torch/stone order.
+pub(crate) fn load_torch_textures() -> Result<[image::RgbaImage; 5], Box<dyn Error>> {
+    const NAMES: [&str; 5] = [
+        "redstone_torch.png",
+        "copper_torch.png",
+        "soul_torch.png",
+        "torch.png",
+        "smooth_stone.png",
+    ];
+    let embedded = embedded_torch_textures();
+    let sources: [AssetSource; 5] = std::array::from_fn(|index| {
+        select_source(
+            None,
+            configured_asset_path(&format!("{TORCH_ASSETS_RELATIVE}/{}", NAMES[index])),
+            embedded.map(|textures| textures[index]),
+            &format!("{TORCH_ASSETS_RELATIVE}/{}", NAMES[index]),
+        )
+    });
+    let images = sources
+        .into_iter()
+        .map(|source| {
+            let encoded = match source {
+                AssetSource::Path(path) => fs::read(&path).map_err(|error| {
+                    source_io_error(ASSETS_ROOT_ENV, &path, "read torch texture", error)
+                })?,
+                AssetSource::Embedded(bytes) => bytes.to_vec(),
+            };
+            Ok::<_, Box<dyn Error>>(
+                image::load_from_memory_with_format(&encoded, image::ImageFormat::Png)?.to_rgba8(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    images
+        .try_into()
+        .map_err(|_| "torch texture table must contain exactly five images".into())
+}
+
 fn configured_path(variable: &str) -> Option<PathBuf> {
     std::env::var_os(variable).map(PathBuf::from)
 }
 
+fn configured_asset_path(relative: &str) -> Option<PathBuf> {
+    configured_path(ASSETS_ROOT_ENV).map(|root| root.join(relative))
+}
+
 fn select_source(
-    configured_path: Option<PathBuf>,
+    dedicated_path: Option<PathBuf>,
+    assets_path: Option<PathBuf>,
     embedded: Option<&'static [u8]>,
-    default_path: &'static str,
+    relative_path: &str,
 ) -> AssetSource {
-    if let Some(path) = configured_path {
+    if let Some(path) = dedicated_path {
+        AssetSource::Path(path)
+    } else if let Some(path) = assets_path {
         AssetSource::Path(path)
     } else if let Some(bytes) = embedded {
         AssetSource::Embedded(bytes)
     } else {
-        AssetSource::Path(PathBuf::from(default_path))
+        AssetSource::Path(PathBuf::from("assets").join(relative_path))
     }
 }
 
@@ -147,6 +202,16 @@ fn embedded_web_wasm() -> Option<&'static [u8]> {
     None
 }
 
+#[cfg(feature = "embed-assets")]
+fn embedded_torch_textures() -> Option<[&'static [u8]; 5]> {
+    Some(EMBEDDED_TORCH_TEXTURES)
+}
+
+#[cfg(not(feature = "embed-assets"))]
+fn embedded_torch_textures() -> Option<[&'static [u8]; 5]> {
+    None
+}
+
 fn source_io_error(
     variable: &str,
     path: &Path,
@@ -166,46 +231,43 @@ fn source_io_error(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{AssetSource, DEFAULT_RESOURCES_ARCHIVE, DEFAULT_WEB_WASM, select_source};
+    use super::{AssetSource, RESOURCES_ARCHIVE_RELATIVE, select_source};
 
     #[test]
-    fn explicit_path_has_highest_priority() {
-        let configured = PathBuf::from("configured/resources.zip");
+    fn dedicated_path_has_highest_priority() {
+        let dedicated = PathBuf::from("configured/resources.zip");
         let source = select_source(
-            Some(configured.clone()),
+            Some(dedicated.clone()),
+            Some(PathBuf::from("root/resources.zip")),
             Some(b"embedded"),
-            DEFAULT_RESOURCES_ARCHIVE,
+            RESOURCES_ARCHIVE_RELATIVE,
         );
-
-        match source {
-            AssetSource::Path(path) => assert_eq!(path, configured),
-            AssetSource::Embedded(_) => panic!("explicit path did not take priority"),
-        }
+        assert!(matches!(source, AssetSource::Path(path) if path == dedicated));
     }
 
     #[test]
-    fn embedded_bytes_are_the_fallback_when_available() {
-        let embedded = b"embedded";
-        let source = select_source(None, Some(embedded), DEFAULT_RESOURCES_ARCHIVE);
-
-        match source {
-            AssetSource::Embedded(bytes) => assert_eq!(bytes, embedded),
-            AssetSource::Path(_) => panic!("embedded fallback was not selected"),
-        }
+    fn assets_root_precedes_embedded_bytes() {
+        let assets = PathBuf::from("root/resources.zip");
+        let source = select_source(
+            None,
+            Some(assets.clone()),
+            Some(b"embedded"),
+            RESOURCES_ARCHIVE_RELATIVE,
+        );
+        assert!(matches!(source, AssetSource::Path(path) if path == assets));
     }
 
     #[test]
-    fn defaults_are_relative_paths_when_no_other_source_exists() {
-        let archive = select_source(None, None, DEFAULT_RESOURCES_ARCHIVE);
-        let wasm = select_source(None, None, DEFAULT_WEB_WASM);
+    fn embedded_bytes_precede_the_cwd_fallback() {
+        let source = select_source(None, None, Some(b"embedded"), RESOURCES_ARCHIVE_RELATIVE);
+        assert!(matches!(source, AssetSource::Embedded(bytes) if bytes == b"embedded"));
+    }
 
-        match archive {
-            AssetSource::Path(path) => assert_eq!(path, PathBuf::from("assets/resources.zip")),
-            AssetSource::Embedded(_) => panic!("unexpected embedded archive"),
-        }
-        match wasm {
-            AssetSource::Path(path) => assert_eq!(path, PathBuf::from("assets/mcse_web_bg.wasm")),
-            AssetSource::Embedded(_) => panic!("unexpected embedded Web WASM"),
-        }
+    #[test]
+    fn default_is_relative_to_the_cwd_assets_directory() {
+        let source = select_source(None, None, None, RESOURCES_ARCHIVE_RELATIVE);
+        assert!(
+            matches!(source, AssetSource::Path(path) if path == std::path::Path::new("assets/resources.zip"))
+        );
     }
 }

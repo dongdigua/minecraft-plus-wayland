@@ -115,10 +115,9 @@ impl TriangleAnimation {
         visual: LockVisual,
     ) {
         let rgba = match visual {
-            LockVisual::Hidden => return,
+            LockVisual::Hidden | LockVisual::Torch { .. } => return,
             // Endpoint-only RGB primaries remain numerically identical on UNORM and sRGB
-            // surfaces, avoiding a second color-space policy for this temporary overlay.
-            LockVisual::InputBlue => [0.0, 0.0, 1.0, 1.0],
+            // surfaces, avoiding a second color-space policy for these retained overlays.
             LockVisual::AuthenticatingYellow => [1.0, 1.0, 0.0, 1.0],
             LockVisual::FailedRed => [1.0, 0.0, 0.0, 1.0],
             LockVisual::AuthenticatedGreen { .. } => [0.0, 1.0, 0.0, 1.0],

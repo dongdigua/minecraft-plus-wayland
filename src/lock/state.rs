@@ -1,8 +1,17 @@
 use std::time::{Duration, Instant};
 
-pub const INPUT_FLASH_DURATION: Duration = Duration::from_millis(150);
+use rand::Rng;
+
 pub const SUCCESS_DURATION: Duration = Duration::from_millis(500);
 pub const IDLE_CLEAR_DURATION: Duration = Duration::from_secs(10);
+pub const ESC_FLASH_STEP_DURATION: Duration = Duration::from_millis(100);
+const ESC_FLASH_STEPS: u8 = 4;
+
+pub const REDSTONE_BIT: u8 = 0b0001;
+pub const COPPER_BIT: u8 = 0b0010;
+pub const SOUL_BIT: u8 = 0b0100;
+pub const TORCH_BIT: u8 = 0b1000;
+pub const ALL_TORCHES_MASK: u8 = REDSTONE_BIT | COPPER_BIT | SOUL_BIT | TORCH_BIT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AttemptId(u64);
@@ -23,7 +32,7 @@ pub enum AuthDecision {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockVisual {
     Hidden,
-    InputBlue,
+    Torch { mask: u8, state_id: u64 },
     AuthenticatingYellow,
     FailedRed,
     AuthenticatedGreen { attempt: AttemptId },
@@ -48,12 +57,21 @@ enum Phase {
     Fatal,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EscFlash {
+    step: u8,
+    next_step_at: Instant,
+}
+
 /// Pure lock/authentication state. Wayland, PAM, channels and GPU objects stay outside this type.
 pub struct LockState {
     phase: Phase,
     next_attempt: u64,
     failures: u8,
-    input_flash_until: Option<Instant>,
+    torch_mask: u8,
+    torch_visible: bool,
+    torch_state_id: u64,
+    esc_flash: Option<EscFlash>,
     last_input_at: Option<Instant>,
     compositor_confirmed: bool,
     unlock_called: bool,
@@ -65,7 +83,10 @@ impl LockState {
             phase: Phase::LockPending,
             next_attempt: 1,
             failures: 0,
-            input_flash_until: None,
+            torch_mask: ALL_TORCHES_MASK,
+            torch_visible: false,
+            torch_state_id: 0,
+            esc_flash: None,
             last_input_at: None,
             compositor_confirmed: false,
             unlock_called: false,
@@ -83,18 +104,47 @@ impl LockState {
     }
 
     pub fn can_edit(&self) -> bool {
-        self.phase == Phase::Idle && self.compositor_confirmed
+        self.phase == Phase::Idle && self.compositor_confirmed && self.esc_flash.is_none()
     }
 
+    /// Records an edit that actually changed the password and chooses one valid torch flip.
     pub fn note_edit(&mut self, now: Instant) {
-        if self.can_edit() {
-            self.input_flash_until = now.checked_add(INPUT_FLASH_DURATION);
-            self.last_input_at = Some(now);
+        if !self.can_edit() {
+            return;
         }
+        let valid_count = valid_flip_count(self.torch_mask);
+        let choice = rand::thread_rng().gen_range(0, valid_count);
+        self.note_edit_with_choice(now, choice);
     }
 
+    fn note_edit_with_choice(&mut self, now: Instant, choice: usize) {
+        if !self.can_edit() {
+            return;
+        }
+        self.torch_mask = mask_after_valid_flip(self.torch_mask, choice)
+            .expect("random choice is inside the valid torch flip set");
+        self.torch_visible = true;
+        self.advance_torch_state();
+        self.last_input_at = Some(now);
+    }
+
+    /// Clears input feedback into the fixed on/off/on/off sequence. Input stays frozen until it ends.
     pub fn note_cancel(&mut self, now: Instant) {
-        self.note_edit(now);
+        if !self.can_edit() {
+            return;
+        }
+        self.torch_mask = ALL_TORCHES_MASK;
+        self.torch_visible = true;
+        self.last_input_at = None;
+        let Some(next_step_at) = now.checked_add(ESC_FLASH_STEP_DURATION) else {
+            self.enter_fatal();
+            return;
+        };
+        self.esc_flash = Some(EscFlash {
+            step: 0,
+            next_step_at,
+        });
+        self.advance_torch_state();
     }
 
     pub fn begin_authentication(&mut self) -> Option<AttemptId> {
@@ -104,8 +154,7 @@ impl LockState {
         let attempt = AttemptId::new(self.next_attempt);
         self.next_attempt = self.next_attempt.checked_add(1)?;
         self.phase = Phase::Authenticating { attempt };
-        self.input_flash_until = None;
-        self.last_input_at = None;
+        self.hide_torches();
         Some(attempt)
     }
 
@@ -143,27 +192,46 @@ impl LockState {
 
     /// Advances monotonic deadlines. Returns true when an idle password must be cleared.
     pub fn tick(&mut self, now: Instant) -> bool {
-        if self
-            .input_flash_until
-            .is_some_and(|deadline| now >= deadline)
+        while let Some(flash) = self.esc_flash
+            && now >= flash.next_step_at
         {
-            self.input_flash_until = None;
+            let next_step = flash.step + 1;
+            self.advance_torch_state();
+            if next_step == ESC_FLASH_STEPS {
+                self.torch_mask = ALL_TORCHES_MASK;
+                self.esc_flash = None;
+                // Timeout begins at the exact end of the flash, even if dispatch was delayed.
+                self.last_input_at = Some(flash.next_step_at);
+                break;
+            }
+            self.torch_mask = if next_step.is_multiple_of(2) {
+                ALL_TORCHES_MASK
+            } else {
+                0
+            };
+            let Some(next_step_at) = flash.next_step_at.checked_add(ESC_FLASH_STEP_DURATION) else {
+                self.enter_fatal();
+                return false;
+            };
+            self.esc_flash = Some(EscFlash {
+                step: next_step,
+                next_step_at,
+            });
         }
+
         match self.phase {
-            Phase::Idle => {
+            Phase::Idle if self.esc_flash.is_none() => {
                 if self
                     .last_input_at
                     .is_some_and(|last| now.saturating_duration_since(last) >= IDLE_CLEAR_DURATION)
                 {
-                    self.last_input_at = None;
-                    self.input_flash_until = None;
+                    self.hide_torches();
                     return true;
                 }
             }
             Phase::AuthFailed { retry_after } if now >= retry_after => {
                 self.phase = Phase::Idle;
-                self.input_flash_until = None;
-                self.last_input_at = None;
+                self.hide_torches();
             }
             _ => {}
         }
@@ -172,31 +240,23 @@ impl LockState {
 
     pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
         let phase_deadline = match self.phase {
-            Phase::Idle => self
-                .last_input_at
-                .and_then(|last| last.checked_add(IDLE_CLEAR_DURATION)),
+            Phase::Idle => self.esc_flash.map(|flash| flash.next_step_at).or_else(|| {
+                self.last_input_at
+                    .and_then(|last| last.checked_add(IDLE_CLEAR_DURATION))
+            }),
             Phase::AuthFailed { retry_after } => Some(retry_after),
             Phase::Authenticated { started_at, .. } => started_at.checked_add(SUCCESS_DURATION),
             _ => None,
         };
-        let input_deadline = self.input_flash_until.filter(|deadline| *deadline > now);
-        let phase_deadline = phase_deadline.filter(|deadline| *deadline > now);
-        match (input_deadline, phase_deadline) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-            (None, None) => None,
-        }
+        phase_deadline.filter(|deadline| *deadline > now)
     }
 
-    pub fn visual(&self, now: Instant) -> LockVisual {
+    pub fn visual(&self, _now: Instant) -> LockVisual {
         match self.phase {
-            Phase::Idle
-                if self
-                    .input_flash_until
-                    .is_some_and(|deadline| now < deadline) =>
-            {
-                LockVisual::InputBlue
-            }
+            Phase::Idle if self.torch_visible => LockVisual::Torch {
+                mask: self.torch_mask,
+                state_id: self.torch_state_id,
+            },
             Phase::Authenticating { .. } => LockVisual::AuthenticatingYellow,
             Phase::AuthFailed { .. } | Phase::Fatal => LockVisual::FailedRed,
             Phase::Authenticated { attempt, .. } => LockVisual::AuthenticatedGreen { attempt },
@@ -240,8 +300,7 @@ impl LockState {
     /// Returns whether the compositor had previously confirmed the lock.
     pub fn compositor_finished(&mut self) -> bool {
         let was_locked = self.compositor_confirmed;
-        self.input_flash_until = None;
-        self.last_input_at = None;
+        self.hide_torches();
         self.phase = if was_locked {
             Phase::Fatal
         } else {
@@ -251,13 +310,22 @@ impl LockState {
     }
 
     pub fn enter_fatal(&mut self) {
-        self.input_flash_until = None;
-        self.last_input_at = None;
+        self.hide_torches();
         self.phase = Phase::Fatal;
     }
 
     pub fn is_fatal(&self) -> bool {
         self.phase == Phase::Fatal
+    }
+
+    fn advance_torch_state(&mut self) {
+        self.torch_state_id = self.torch_state_id.wrapping_add(1);
+    }
+
+    fn hide_torches(&mut self) {
+        self.torch_visible = false;
+        self.esc_flash = None;
+        self.last_input_at = None;
     }
 }
 
@@ -265,6 +333,22 @@ impl Default for LockState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn valid_flip_count(mask: u8) -> usize {
+    (0..4)
+        .filter(|bit| {
+            let candidate = mask ^ (1 << bit);
+            candidate != 0 && candidate != ALL_TORCHES_MASK
+        })
+        .count()
+}
+
+fn mask_after_valid_flip(mask: u8, choice: usize) -> Option<u8> {
+    (0..4)
+        .map(|bit| mask ^ (1 << bit))
+        .filter(|candidate| *candidate != 0 && *candidate != ALL_TORCHES_MASK)
+        .nth(choice)
 }
 
 #[cfg(test)]
@@ -334,25 +418,90 @@ mod tests {
     }
 
     #[test]
-    fn blue_flash_and_idle_clear_use_monotonic_deadlines() {
+    fn every_valid_mask_flip_excludes_both_endpoints() {
+        assert_eq!(REDSTONE_BIT, 1 << 0);
+        assert_eq!(COPPER_BIT, 1 << 1);
+        assert_eq!(SOUL_BIT, 1 << 2);
+        assert_eq!(TORCH_BIT, 1 << 3);
+
+        for mask in 0..=ALL_TORCHES_MASK {
+            let count = valid_flip_count(mask);
+            for choice in 0..count {
+                let result = mask_after_valid_flip(mask, choice).unwrap();
+                assert_ne!(result, 0);
+                assert_ne!(result, ALL_TORCHES_MASK);
+                assert_eq!((mask ^ result).count_ones(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn torch_flips_only_when_an_actual_edit_is_recorded() {
         let now = Instant::now();
         let mut state = LockState::new();
         state.compositor_locked();
-        state.note_edit(now);
+        assert_eq!(state.visual(now), LockVisual::Hidden);
+
+        // Rejected/no-op editing never calls note_edit, so neither state nor mask changes.
         assert_eq!(
-            state.next_deadline(now),
-            now.checked_add(INPUT_FLASH_DURATION)
+            state.visual(now + Duration::from_millis(1)),
+            LockVisual::Hidden
         );
-        assert_eq!(state.visual(now), LockVisual::InputBlue);
-        assert_eq!(state.visual(now + INPUT_FLASH_DURATION), LockVisual::Hidden);
-        assert!(!state.tick(now + INPUT_FLASH_DURATION));
+        state.note_edit_with_choice(now, 0);
+        let LockVisual::Torch { mask, state_id } = state.visual(now) else {
+            panic!("successful edit did not show torches");
+        };
+        assert_ne!(mask, 0);
+        assert_ne!(mask, ALL_TORCHES_MASK);
+        assert_eq!(state.visual(now), LockVisual::Torch { mask, state_id });
+    }
+
+    #[test]
+    fn esc_freezes_input_flashes_twice_and_restarts_timeout_at_end() {
+        let start = Instant::now();
+        let mut state = LockState::new();
+        state.compositor_locked();
+        state.note_edit_with_choice(start, 0);
+        state.note_cancel(start);
+        assert!(!state.can_edit());
+
+        for (step, mask) in [(0, ALL_TORCHES_MASK), (1, 0), (2, ALL_TORCHES_MASK), (3, 0)] {
+            let at = start + ESC_FLASH_STEP_DURATION * step;
+            state.tick(at);
+            assert!(
+                matches!(state.visual(at), LockVisual::Torch { mask: actual, .. } if actual == mask)
+            );
+            assert!(!state.can_edit());
+        }
+
+        let end = start + ESC_FLASH_STEP_DURATION * 4;
+        assert!(!state.tick(end));
+        assert!(state.can_edit());
+        assert!(matches!(
+            state.visual(end),
+            LockVisual::Torch {
+                mask: ALL_TORCHES_MASK,
+                ..
+            }
+        ));
         assert_eq!(
-            state.next_deadline(now + INPUT_FLASH_DURATION),
-            now.checked_add(IDLE_CLEAR_DURATION)
+            state.next_deadline(end),
+            end.checked_add(IDLE_CLEAR_DURATION)
         );
+        assert!(!state.tick(end + IDLE_CLEAR_DURATION - Duration::from_millis(1)));
+        assert!(state.tick(end + IDLE_CLEAR_DURATION));
+        assert_eq!(state.visual(end + IDLE_CLEAR_DURATION), LockVisual::Hidden);
+    }
+
+    #[test]
+    fn ordinary_input_times_out_to_the_module() {
+        let now = Instant::now();
+        let mut state = LockState::new();
+        state.compositor_locked();
+        state.note_edit_with_choice(now, 0);
         assert!(!state.tick(now + IDLE_CLEAR_DURATION - Duration::from_millis(1)));
         assert!(state.tick(now + IDLE_CLEAR_DURATION));
-        assert_eq!(state.next_deadline(now + IDLE_CLEAR_DURATION), None);
+        assert_eq!(state.visual(now + IDLE_CLEAR_DURATION), LockVisual::Hidden);
     }
 
     #[test]

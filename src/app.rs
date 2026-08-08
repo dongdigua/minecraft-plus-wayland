@@ -43,7 +43,7 @@ use smithay_client_toolkit::{
 
 use crate::{
     lock::{
-        animations::TriangleAnimation,
+        animations::LockAnimation,
         auth::pam::PamAuthenticator,
         identity::TrustedIdentity,
         secret::{LockedSecret, SecretError, disable_process_dumps},
@@ -381,7 +381,7 @@ fn parse_options(
 struct RenderState {
     renderer: Renderer,
     module: Box<dyn Module>,
-    overlay: Option<TriangleAnimation>,
+    overlay: Option<LockAnimation>,
     configured_size: Option<RenderSize>,
     module_initialized: bool,
     frame_pending: bool,
@@ -394,7 +394,7 @@ impl RenderState {
         Self {
             renderer,
             module: module_selection.create(),
-            overlay: lock_overlay.then(TriangleAnimation::new),
+            overlay: lock_overlay.then(LockAnimation::new),
             configured_size: None,
             module_initialized: false,
             frame_pending: false,
@@ -426,7 +426,7 @@ impl RenderState {
         }
         self.module.resize(&context, size);
         if let Some(overlay) = &mut self.overlay {
-            overlay.ensure_initialized(&context);
+            overlay.ensure_initialized(&context, size)?;
         }
         Ok(())
     }
@@ -588,8 +588,15 @@ impl App {
         qh: &QueueHandle<Self>,
         visual: LockVisual,
     ) -> Result<RenderOutcome, Box<dyn Error>> {
-        let continuous = render.module.wants_continuous_frames()
-            || matches!(visual, LockVisual::AuthenticatedGreen { .. });
+        let overlay_continuous = render
+            .overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.wants_continuous_frames(visual));
+        let continuous = continuous_frame_required(
+            visual,
+            render.module.wants_continuous_frames(),
+            overlay_continuous,
+        );
         if continuous && !render.frame_pending {
             surface.frame(qh, FrameCallbackData(surface.clone()));
             render.frame_pending = true;
@@ -1261,6 +1268,19 @@ impl ProvidesRegistryState for App {
 
 smithay_client_toolkit::delegate_dispatch2!(App);
 
+fn continuous_frame_required(
+    visual: LockVisual,
+    module_continuous: bool,
+    overlay_continuous: bool,
+) -> bool {
+    match visual {
+        // The opaque torch scene owns its frame chain. Otherwise a continuously animated hidden
+        // module would keep presenting the converged cache forever.
+        LockVisual::Torch { .. } => overlay_continuous,
+        _ => module_continuous || overlay_continuous,
+    }
+}
+
 fn all_outputs_presented(
     markers: impl IntoIterator<Item = Option<AttemptId>>,
     attempt: AttemptId,
@@ -1274,8 +1294,19 @@ fn all_outputs_presented(
 
 #[cfg(test)]
 mod tests {
-    use super::all_outputs_presented;
-    use crate::lock::state::AttemptId;
+    use super::{all_outputs_presented, continuous_frame_required};
+    use crate::lock::state::{AttemptId, LockVisual};
+
+    #[test]
+    fn converged_torch_ignores_a_hidden_continuous_module() {
+        let torch = LockVisual::Torch {
+            mask: 0b0111,
+            state_id: 4,
+        };
+        assert!(continuous_frame_required(torch, true, true));
+        assert!(!continuous_frame_required(torch, true, false));
+        assert!(continuous_frame_required(LockVisual::Hidden, true, false));
+    }
 
     #[test]
     fn output_add_remove_bookkeeping_cannot_reuse_an_old_green_frame() {
