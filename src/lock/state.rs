@@ -2,7 +2,8 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 
-pub const SUCCESS_DURATION: Duration = Duration::from_millis(500);
+pub const CREEPER_APPROACH_DURATION: Duration = Duration::from_millis(500);
+pub const DISSOLVE_DURATION: Duration = Duration::from_secs(1);
 pub const IDLE_CLEAR_DURATION: Duration = Duration::from_secs(10);
 pub const ESC_FLASH_STEP_DURATION: Duration = Duration::from_millis(100);
 const ESC_FLASH_STEPS: u8 = 4;
@@ -32,10 +33,47 @@ pub enum AuthDecision {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockVisual {
     Hidden,
-    Torch { mask: u8, state_id: u64 },
-    AuthenticatingYellow,
-    FailedRed,
-    AuthenticatedGreen { attempt: AttemptId },
+    Torch {
+        mask: u8,
+        state_id: u64,
+    },
+    Creeper {
+        approach_started_at: Instant,
+        red: bool,
+    },
+    DissolvingCreeper {
+        attempt: AttemptId,
+        frozen_approach: Duration,
+        started_at: Instant,
+    },
+    FatalBlack,
+}
+
+impl LockVisual {
+    pub fn wants_continuous_frames(self, now: Instant) -> bool {
+        match self {
+            Self::Creeper {
+                approach_started_at,
+                ..
+            } => now.saturating_duration_since(approach_started_at) < CREEPER_APPROACH_DURATION,
+            // Keep retrying the terminal all-black frame until every output has actually
+            // presented it and the state leaves this visual through the unlock gate.
+            Self::DissolvingCreeper { .. } => true,
+            _ => false,
+        }
+    }
+
+    pub fn completed_dissolve_attempt(self, now: Instant) -> Option<AttemptId> {
+        let Self::DissolvingCreeper {
+            attempt,
+            started_at,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        (now.saturating_duration_since(started_at) >= DISSOLVE_DURATION).then_some(attempt)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,12 +82,15 @@ enum Phase {
     Idle,
     Authenticating {
         attempt: AttemptId,
+        approach_started_at: Instant,
     },
     AuthFailed {
         retry_after: Instant,
+        approach_started_at: Instant,
     },
     Authenticated {
         attempt: AttemptId,
+        frozen_approach: Duration,
         started_at: Instant,
     },
     UnlockRequested,
@@ -147,13 +188,16 @@ impl LockState {
         self.advance_torch_state();
     }
 
-    pub fn begin_authentication(&mut self) -> Option<AttemptId> {
+    pub fn begin_authentication(&mut self, now: Instant) -> Option<AttemptId> {
         if !self.can_edit() {
             return None;
         }
         let attempt = AttemptId::new(self.next_attempt);
         self.next_attempt = self.next_attempt.checked_add(1)?;
-        self.phase = Phase::Authenticating { attempt };
+        self.phase = Phase::Authenticating {
+            attempt,
+            approach_started_at: now,
+        };
         self.hide_torches();
         Some(attempt)
     }
@@ -165,13 +209,23 @@ impl LockState {
         decision: AuthDecision,
         now: Instant,
     ) -> bool {
-        if self.phase != (Phase::Authenticating { attempt }) {
+        let Phase::Authenticating {
+            attempt: current_attempt,
+            approach_started_at,
+        } = self.phase
+        else {
+            return false;
+        };
+        if current_attempt != attempt {
             return false;
         }
         match decision {
             AuthDecision::Authenticated => {
                 self.phase = Phase::Authenticated {
                     attempt,
+                    frozen_approach: now
+                        .saturating_duration_since(approach_started_at)
+                        .min(CREEPER_APPROACH_DURATION),
                     started_at: now,
                 };
             }
@@ -183,7 +237,10 @@ impl LockState {
                     self.enter_fatal();
                     return true;
                 };
-                self.phase = Phase::AuthFailed { retry_after };
+                self.phase = Phase::AuthFailed {
+                    retry_after,
+                    approach_started_at,
+                };
             }
             AuthDecision::SystemFailure => self.enter_fatal(),
         }
@@ -229,9 +286,14 @@ impl LockState {
                     return true;
                 }
             }
-            Phase::AuthFailed { retry_after } if now >= retry_after => {
+            Phase::AuthFailed { retry_after, .. } if now >= retry_after => {
                 self.phase = Phase::Idle;
-                self.hide_torches();
+                self.torch_mask = ALL_TORCHES_MASK;
+                self.torch_visible = true;
+                self.advance_torch_state();
+                // A failed password is never restored. The initial all-on torch scene starts a
+                // fresh empty-input idle period at the exact end of the authentication backoff.
+                self.last_input_at = Some(retry_after);
             }
             _ => {}
         }
@@ -244,8 +306,8 @@ impl LockState {
                 self.last_input_at
                     .and_then(|last| last.checked_add(IDLE_CLEAR_DURATION))
             }),
-            Phase::AuthFailed { retry_after } => Some(retry_after),
-            Phase::Authenticated { started_at, .. } => started_at.checked_add(SUCCESS_DURATION),
+            Phase::AuthFailed { retry_after, .. } => Some(retry_after),
+            Phase::Authenticated { started_at, .. } => started_at.checked_add(DISSOLVE_DURATION),
             _ => None,
         };
         phase_deadline.filter(|deadline| *deadline > now)
@@ -257,9 +319,30 @@ impl LockState {
                 mask: self.torch_mask,
                 state_id: self.torch_state_id,
             },
-            Phase::Authenticating { .. } => LockVisual::AuthenticatingYellow,
-            Phase::AuthFailed { .. } | Phase::Fatal => LockVisual::FailedRed,
-            Phase::Authenticated { attempt, .. } => LockVisual::AuthenticatedGreen { attempt },
+            Phase::Authenticating {
+                approach_started_at,
+                ..
+            } => LockVisual::Creeper {
+                approach_started_at,
+                red: false,
+            },
+            Phase::AuthFailed {
+                approach_started_at,
+                ..
+            } => LockVisual::Creeper {
+                approach_started_at,
+                red: true,
+            },
+            Phase::Authenticated {
+                attempt,
+                frozen_approach,
+                started_at,
+            } => LockVisual::DissolvingCreeper {
+                attempt,
+                frozen_approach,
+                started_at,
+            },
+            Phase::Fatal => LockVisual::FatalBlack,
             _ => LockVisual::Hidden,
         }
     }
@@ -268,7 +351,7 @@ impl LockState {
         let Phase::Authenticated { started_at, .. } = self.phase else {
             return false;
         };
-        if !all_outputs_presented || now.saturating_duration_since(started_at) < SUCCESS_DURATION {
+        if !all_outputs_presented || now.saturating_duration_since(started_at) < DISSOLVE_DURATION {
             return false;
         }
         self.phase = Phase::UnlockRequested;
@@ -287,6 +370,14 @@ impl LockState {
 
     pub fn awaiting_unlock_sync(&self) -> bool {
         self.phase == Phase::UnlockRequested && self.unlock_called
+    }
+
+    pub fn can_use_lock_surfaces(&self) -> bool {
+        !self.unlock_called && !matches!(self.phase, Phase::Finished | Phase::Fatal)
+    }
+
+    pub fn accepts_new_outputs(&self) -> bool {
+        self.can_use_lock_surfaces() && self.phase != Phase::UnlockRequested
     }
 
     pub fn unlock_sync_completed(&mut self) -> bool {
@@ -360,47 +451,139 @@ mod tests {
         let now = Instant::now();
         let mut state = LockState::new();
         assert!(!state.can_edit());
-        assert_eq!(state.begin_authentication(), None);
-        assert!(!state.prepare_unlock(now + SUCCESS_DURATION, true));
+        assert_eq!(state.begin_authentication(now), None);
+        assert!(!state.prepare_unlock(now + DISSOLVE_DURATION, true));
         assert!(!state.consume_unlock_gate());
     }
 
     #[test]
-    fn only_matching_success_can_reach_the_once_only_unlock_gate() {
-        let now = Instant::now();
+    fn only_matching_success_and_presented_dissolve_can_reach_unlock_gate() {
+        let approach_started_at = Instant::now();
+        let authenticated_at = approach_started_at + Duration::from_millis(200);
         let mut state = LockState::new();
         assert!(state.compositor_locked());
-        let attempt = state.begin_authentication().unwrap();
-        assert!(!state.authentication_result(AttemptId::new(99), AuthDecision::Authenticated, now));
-        assert!(state.authentication_result(attempt, AuthDecision::Authenticated, now));
-        assert_eq!(state.next_deadline(now), now.checked_add(SUCCESS_DURATION));
-        state.tick(now + SUCCESS_DURATION);
-        assert_eq!(state.next_deadline(now + SUCCESS_DURATION), None);
-        assert!(!state.prepare_unlock(now + SUCCESS_DURATION, false));
-        assert!(state.prepare_unlock(now + SUCCESS_DURATION, true));
+        let attempt = state.begin_authentication(approach_started_at).unwrap();
+        assert!(!state.authentication_result(
+            AttemptId::new(99),
+            AuthDecision::Authenticated,
+            authenticated_at
+        ));
+        assert!(state.authentication_result(
+            attempt,
+            AuthDecision::Authenticated,
+            authenticated_at
+        ));
+        assert_eq!(
+            state.visual(authenticated_at),
+            LockVisual::DissolvingCreeper {
+                attempt,
+                frozen_approach: Duration::from_millis(200),
+                started_at: authenticated_at,
+            }
+        );
+        assert_eq!(
+            state.next_deadline(authenticated_at),
+            authenticated_at.checked_add(DISSOLVE_DURATION)
+        );
+        assert!(!state.prepare_unlock(
+            authenticated_at + DISSOLVE_DURATION - Duration::from_millis(1),
+            true
+        ));
+        assert!(!state.prepare_unlock(authenticated_at + DISSOLVE_DURATION, false));
+        assert!(state.can_use_lock_surfaces());
+        assert!(state.accepts_new_outputs());
+        assert!(state.prepare_unlock(authenticated_at + DISSOLVE_DURATION, true));
+        assert!(state.can_use_lock_surfaces());
+        assert!(!state.accepts_new_outputs());
         assert!(state.consume_unlock_gate());
         assert!(state.awaiting_unlock_sync());
+        assert!(!state.can_use_lock_surfaces());
+        assert!(!state.accepts_new_outputs());
         assert!(!state.consume_unlock_gate());
         assert!(state.unlock_sync_completed());
         assert!(!state.awaiting_unlock_sync());
+        assert!(!state.can_use_lock_surfaces());
+        assert!(!state.accepts_new_outputs());
         assert!(!state.unlock_sync_completed());
     }
 
     #[test]
-    fn denials_back_off_and_never_unlock() {
+    fn late_success_freezes_creeper_at_the_completed_approach() {
+        let started_at = Instant::now();
+        let authenticated_at = started_at + Duration::from_secs(2);
+        let mut state = LockState::new();
+        state.compositor_locked();
+        let attempt = state.begin_authentication(started_at).unwrap();
+        state.authentication_result(attempt, AuthDecision::Authenticated, authenticated_at);
+        assert!(matches!(
+            state.visual(authenticated_at),
+            LockVisual::DissolvingCreeper {
+                frozen_approach: CREEPER_APPROACH_DURATION,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn visual_frame_chain_and_completion_use_monotonic_deadlines() {
+        let started_at = Instant::now();
+        let approaching = LockVisual::Creeper {
+            approach_started_at: started_at,
+            red: false,
+        };
+        assert!(approaching.wants_continuous_frames(
+            started_at + CREEPER_APPROACH_DURATION - Duration::from_millis(1)
+        ));
+        assert!(!approaching.wants_continuous_frames(started_at + CREEPER_APPROACH_DURATION));
+
+        let attempt = AttemptId::new(7);
+        let dissolving = LockVisual::DissolvingCreeper {
+            attempt,
+            frozen_approach: CREEPER_APPROACH_DURATION,
+            started_at,
+        };
+        assert!(dissolving.wants_continuous_frames(started_at + DISSOLVE_DURATION));
+        assert_eq!(
+            dissolving.completed_dissolve_attempt(
+                started_at + DISSOLVE_DURATION - Duration::from_millis(1)
+            ),
+            None
+        );
+        assert_eq!(
+            dissolving.completed_dissolve_attempt(started_at + DISSOLVE_DURATION),
+            Some(attempt)
+        );
+    }
+
+    #[test]
+    fn denials_back_off_return_to_empty_all_on_torches_and_never_unlock() {
         let start = Instant::now();
         let mut now = start;
         let mut state = LockState::new();
         state.compositor_locked();
         for expected in [1, 2, 4, 8, 8] {
-            let attempt = state.begin_authentication().unwrap();
+            state.note_edit_with_choice(now, 0);
+            let attempt = state.begin_authentication(now).unwrap();
             state.authentication_result(attempt, AuthDecision::Denied, now);
-            assert_eq!(state.visual(now), LockVisual::FailedRed);
+            assert_eq!(
+                state.visual(now),
+                LockVisual::Creeper {
+                    approach_started_at: now,
+                    red: true,
+                }
+            );
             assert!(!state.prepare_unlock(now + Duration::from_secs(expected), true));
             assert!(!state.can_edit());
             now += Duration::from_secs(expected);
             state.tick(now);
             assert!(state.can_edit());
+            assert!(matches!(
+                state.visual(now),
+                LockVisual::Torch {
+                    mask: ALL_TORCHES_MASK,
+                    ..
+                }
+            ));
         }
         assert!(!state.consume_unlock_gate());
     }
@@ -410,10 +593,10 @@ mod tests {
         let now = Instant::now();
         let mut state = LockState::new();
         state.compositor_locked();
-        let attempt = state.begin_authentication().unwrap();
+        let attempt = state.begin_authentication(now).unwrap();
         state.authentication_result(attempt, AuthDecision::SystemFailure, now);
         assert!(state.is_fatal());
-        assert_eq!(state.visual(now), LockVisual::FailedRed);
+        assert_eq!(state.visual(now), LockVisual::FatalBlack);
         assert!(!state.consume_unlock_gate());
     }
 

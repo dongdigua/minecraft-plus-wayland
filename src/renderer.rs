@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, ptr::NonNull};
+use std::{error::Error, fmt, ptr::NonNull, time::Instant};
 
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, RawDisplayHandle, RawWindowHandle,
@@ -170,7 +170,7 @@ impl Renderer {
         &mut self,
         module: &mut dyn Module,
         frame: FrameInfo,
-        lock_overlay: Option<(&mut LockAnimation, LockVisual)>,
+        lock_overlay: Option<(&mut LockAnimation, LockVisual, Instant)>,
     ) -> RendererResult<RenderOutcome> {
         let Some(config) = self.config.as_ref() else {
             return Ok(RenderOutcome::Skipped);
@@ -212,8 +212,15 @@ impl Renderer {
             });
         let context = self.context();
         module.render(&context, &mut encoder, &view, frame);
-        if let Some((overlay, visual)) = lock_overlay {
-            overlay.draw(&context, &mut encoder, &view, frame.size, visual);
+        if let Some((overlay, visual, frame_time)) = lock_overlay {
+            overlay.draw(
+                &context,
+                &mut encoder,
+                &view,
+                frame.size,
+                visual,
+                frame_time,
+            );
         }
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(surface_texture);

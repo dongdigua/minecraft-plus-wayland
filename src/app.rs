@@ -230,7 +230,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             } = lock_setup.take().expect("lock setup exists in lock mode");
             lock_replies = Some(replies);
             (
-                Mode::Lock(LockTargets {
+                Mode::Lock(Box::new(LockTargets {
                     targets: Vec::with_capacity(outputs.len()),
                     session_lock,
                     state: LockState::new(),
@@ -239,7 +239,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     unlock_sync: None,
                     redraw_all: false,
                     last_visual: LockVisual::Hidden,
-                }),
+                })),
                 Some(session_lock_state),
             )
         }
@@ -378,6 +378,12 @@ fn parse_options(
     Ok(StartupOptions { mode, module })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RenderReport {
+    outcome: RenderOutcome,
+    frame_time: Instant,
+}
+
 struct RenderState {
     renderer: Renderer,
     module: Box<dyn Module>,
@@ -431,22 +437,27 @@ impl RenderState {
         Ok(())
     }
 
-    fn render(&mut self, visual: LockVisual) -> Result<RenderOutcome, Box<dyn Error>> {
+    fn render(
+        &mut self,
+        visual: LockVisual,
+        frame_time: Instant,
+    ) -> Result<RenderOutcome, Box<dyn Error>> {
         let Some(size) = self.configured_size else {
             return Ok(RenderOutcome::Skipped);
         };
-        let now = Instant::now();
         let frame = FrameInfo {
-            elapsed: now.duration_since(self.started_at),
-            delta: now.duration_since(self.last_frame_at),
+            elapsed: frame_time.duration_since(self.started_at),
+            delta: frame_time.duration_since(self.last_frame_at),
             size,
         };
-        self.last_frame_at = now;
+        self.last_frame_at = frame_time;
         self.module.update(frame);
         self.renderer.render(
             self.module.as_mut(),
             frame,
-            self.overlay.as_mut().map(|overlay| (overlay, visual)),
+            self.overlay
+                .as_mut()
+                .map(|overlay| (overlay, visual, frame_time)),
         )
     }
 }
@@ -461,7 +472,7 @@ struct LockTarget {
     render: RenderState,
     output: wl_output::WlOutput,
     surface: SessionLockSurface,
-    green_presented: Option<AttemptId>,
+    dissolve_complete_presented: Option<AttemptId>,
 }
 
 struct LockTargets {
@@ -477,7 +488,7 @@ struct LockTargets {
 
 enum Mode {
     Layer(Box<LayerTarget>),
-    Lock(LockTargets),
+    Lock(Box<LockTargets>),
 }
 
 struct SeatKeyboard {
@@ -531,6 +542,9 @@ impl App {
         let Mode::Lock(lock) = &mut self.mode else {
             return Ok(());
         };
+        if !lock.state.can_use_lock_surfaces() {
+            return Ok(());
+        }
         let visual = lock.state.visual(Instant::now());
         let Some(target) = lock
             .targets
@@ -540,9 +554,9 @@ impl App {
             return Ok(());
         };
         target.render.configure(configure.new_size)?;
-        let outcome =
+        let report =
             Self::render_and_schedule(&mut target.render, target.surface.wl_surface(), qh, visual)?;
-        Self::record_green_present(target, visual, outcome);
+        Self::record_dissolve_complete_present(target, visual, report);
         Ok(())
     }
 
@@ -561,6 +575,9 @@ impl App {
                 )?;
             }
             Mode::Lock(lock) => {
+                if !lock.state.can_use_lock_surfaces() {
+                    return Ok(());
+                }
                 let visual = lock.state.visual(Instant::now());
                 let Some(target) = lock
                     .targets
@@ -569,13 +586,13 @@ impl App {
                 else {
                     return Ok(());
                 };
-                let outcome = Self::render_and_schedule(
+                let report = Self::render_and_schedule(
                     &mut target.render,
                     target.surface.wl_surface(),
                     qh,
                     visual,
                 )?;
-                Self::record_green_present(target, visual, outcome);
+                Self::record_dissolve_complete_present(target, visual, report);
             }
             Mode::Layer(_) => {}
         }
@@ -587,11 +604,14 @@ impl App {
         surface: &wl_surface::WlSurface,
         qh: &QueueHandle<Self>,
         visual: LockVisual,
-    ) -> Result<RenderOutcome, Box<dyn Error>> {
+    ) -> Result<RenderReport, Box<dyn Error>> {
+        // This one timestamp drives the shader uniforms, frame-chain decision and completed-frame
+        // marker. Sampling time again after encoding could mark an incomplete dissolve as complete.
+        let frame_time = Instant::now();
         let overlay_continuous = render
             .overlay
             .as_ref()
-            .is_some_and(|overlay| overlay.wants_continuous_frames(visual));
+            .is_some_and(|overlay| overlay.wants_continuous_frames(visual, frame_time));
         let continuous = continuous_frame_required(
             visual,
             render.module.wants_continuous_frames(),
@@ -601,18 +621,25 @@ impl App {
             surface.frame(qh, FrameCallbackData(surface.clone()));
             render.frame_pending = true;
         }
-        let outcome = render.render(visual)?;
+        let outcome = render.render(visual, frame_time)?;
         if continuous && render.frame_pending && outcome == RenderOutcome::Skipped {
             surface.commit();
         }
-        Ok(outcome)
+        Ok(RenderReport {
+            outcome,
+            frame_time,
+        })
     }
 
-    fn record_green_present(target: &mut LockTarget, visual: LockVisual, outcome: RenderOutcome) {
-        if outcome == RenderOutcome::Presented
-            && let LockVisual::AuthenticatedGreen { attempt } = visual
+    fn record_dissolve_complete_present(
+        target: &mut LockTarget,
+        visual: LockVisual,
+        report: RenderReport,
+    ) {
+        if report.outcome == RenderOutcome::Presented
+            && let Some(attempt) = visual.completed_dissolve_attempt(report.frame_time)
         {
-            target.green_presented = Some(attempt);
+            target.dissolve_complete_presented = Some(attempt);
         }
     }
 
@@ -620,15 +647,18 @@ impl App {
         let Mode::Lock(lock) = &mut self.mode else {
             return Ok(());
         };
+        if !lock.state.can_use_lock_surfaces() {
+            return Ok(());
+        }
         let visual = lock.state.visual(Instant::now());
         for target in &mut lock.targets {
-            let outcome = Self::render_and_schedule(
+            let report = Self::render_and_schedule(
                 &mut target.render,
                 target.surface.wl_surface(),
                 qh,
                 visual,
             )?;
-            Self::record_green_present(target, visual, outcome);
+            Self::record_dissolve_complete_present(target, visual, report);
         }
         Ok(())
     }
@@ -642,6 +672,11 @@ impl App {
         let Mode::Lock(lock) = &self.mode else {
             return Ok(());
         };
+        // unlock_and_destroy invalidates the session-lock object before the ordered sync reply.
+        // Ignore registry hotplug in that interval instead of issuing get_lock_surface on it.
+        if !lock.state.accepts_new_outputs() {
+            return Ok(());
+        }
         if lock.targets.iter().any(|target| target.output == output) {
             return Ok(());
         }
@@ -660,7 +695,7 @@ impl App {
             render,
             output,
             surface: lock_surface,
-            green_presented: None,
+            dissolve_complete_presented: None,
         });
         lock.redraw_all = true;
         Ok(())
@@ -753,7 +788,7 @@ impl App {
             }
         };
         let password = std::mem::replace(&mut lock.password, replacement);
-        let Some(attempt) = lock.state.begin_authentication() else {
+        let Some(attempt) = lock.state.begin_authentication(Instant::now()) else {
             drop(password);
             return;
         };
@@ -834,13 +869,17 @@ impl App {
         }
 
         let ready = if let Mode::Lock(lock) = &self.mode {
-            match lock.state.visual(now) {
-                LockVisual::AuthenticatedGreen { attempt } => all_outputs_presented(
-                    lock.targets.iter().map(|target| target.green_presented),
-                    attempt,
-                ),
-                _ => false,
-            }
+            let visual = lock.state.visual(now);
+            visual
+                .completed_dissolve_attempt(now)
+                .is_some_and(|attempt| {
+                    all_outputs_presented(
+                        lock.targets
+                            .iter()
+                            .map(|target| target.dissolve_complete_presented),
+                        attempt,
+                    )
+                })
         } else {
             false
         };
@@ -1274,10 +1313,13 @@ fn continuous_frame_required(
     overlay_continuous: bool,
 ) -> bool {
     match visual {
-        // The opaque torch scene owns its frame chain. Otherwise a continuously animated hidden
-        // module would keep presenting the converged cache forever.
-        LockVisual::Torch { .. } => overlay_continuous,
-        _ => module_continuous || overlay_continuous,
+        // Opaque lock scenes own their frame chains. Otherwise a continuously animated hidden
+        // module would keep rendering behind a converged torch, a stationary creeper or backoff.
+        LockVisual::Torch { .. }
+        | LockVisual::Creeper { .. }
+        | LockVisual::DissolvingCreeper { .. }
+        | LockVisual::FatalBlack => overlay_continuous,
+        LockVisual::Hidden => module_continuous || overlay_continuous,
     }
 }
 
@@ -1306,10 +1348,18 @@ mod tests {
         assert!(continuous_frame_required(torch, true, true));
         assert!(!continuous_frame_required(torch, true, false));
         assert!(continuous_frame_required(LockVisual::Hidden, true, false));
+        assert!(!continuous_frame_required(
+            LockVisual::Creeper {
+                approach_started_at: std::time::Instant::now(),
+                red: false,
+            },
+            true,
+            false,
+        ));
     }
 
     #[test]
-    fn output_add_remove_bookkeeping_cannot_reuse_an_old_green_frame() {
+    fn output_add_remove_bookkeeping_cannot_reuse_an_old_dissolve_frame() {
         let attempt = AttemptId::new(3);
         let old_attempt = AttemptId::new(2);
         let mut outputs = vec![Some(attempt), Some(attempt)];
