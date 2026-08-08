@@ -144,6 +144,7 @@ impl ModuleSelection {
 struct StartupOptions {
     mode: StartupMode,
     module: ModuleSelection,
+    module_switch_interval: Option<Duration>,
 }
 
 struct LockSetup {
@@ -169,6 +170,11 @@ impl LockSetup {
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let startup = parse_startup_options()?;
+    // Validate the interval and establish the shared module timeline before requesting a session
+    // lock. Returning an ordinary startup error after lock() would drop a requested lock object.
+    let module_started_at = Instant::now();
+    let next_module_switch =
+        initial_module_deadline(module_started_at, startup.module_switch_interval)?;
     // Identity, dump hardening, worker construction and the editable secret all succeed before the
     // client requests a session lock.
     let mut lock_setup = match startup.mode {
@@ -208,6 +214,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 Renderer::new(&connection, layer.wl_surface())?,
                 startup.module,
                 false,
+                module_started_at,
             );
             (
                 Mode::Layer(Box::new(LayerTarget {
@@ -254,6 +261,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         seat_state,
         keyboards: Vec::new(),
         module_selection: startup.module,
+        module_started_at,
+        module_switch_interval: startup.module_switch_interval,
+        next_module_switch,
         loop_handle: loop_handle.clone(),
         deadline_timer: None,
         scheduled_deadline: None,
@@ -334,34 +344,52 @@ fn parse_options(
 ) -> Result<StartupOptions, Box<dyn Error>> {
     let mut mode = StartupMode::LayerShell;
     let mut module = None;
+    let mut interval_seconds = None;
+    let mut interval_supplied = false;
     let mut arguments = arguments.into_iter();
 
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--lock" => mode = StartupMode::SessionLock,
-            "--module" => {
+            "--module" | "-m" => {
                 let module_id = arguments
                     .next()
-                    .ok_or("--module requires a module number")?
+                    .ok_or("--module/-m requires a module number")?
                     .parse::<u8>()
-                    .map_err(|_| "--module requires an integer module number")?;
+                    .map_err(|_| "--module/-m requires an integer module number")?;
                 module = Some(ModuleSelection::from_id(module_id).ok_or_else(|| {
                     format!("module={module_id} is outside the valid range 0..=12")
                 })?);
             }
+            "--interval" | "-t" => {
+                interval_supplied = true;
+                interval_seconds = Some(
+                    arguments
+                        .next()
+                        .ok_or("--interval/-t requires a number of seconds")?
+                        .parse::<u64>()
+                        .map_err(
+                            |_| "--interval/-t requires a non-negative integer number of seconds",
+                        )?,
+                );
+            }
             "--help" | "-h" => {
                 return Err(
-                    "Usage: minecraft-plus-wayland [--lock] [--module <n>]\n\nWithout --module, one of the 13 Web modules is selected randomly at startup. --module 0 selects Web module=0 (load cube); --module 1 selects module=1 (dvd bounce trail); --module 2 selects module=2 (dvd bounce direct); --module 3 selects module=3 (item pop); --module 4 selects module=4 (alpha fluids water); --module 5 selects module=5 (alpha fluids lava); --module 6 selects module=6 (panorama); --module 7 selects module=7 (footprint); --module 8 selects module=8 (squid); --module 9 selects module=9 (item bounce); --module 10 selects module=10 (grass); --module 11 selects module=11 (blocks); --module 12 selects module=12 (creeper)."
+                    "Usage: minecraft-plus-wayland [--lock] [--module|-m <n> | --interval|-t <seconds>]\n\nWithout --module, one of the 13 Web modules is selected randomly at startup. --interval/-t switches to a different random module every whole <seconds>; 0 or omitting the option disables switching. --interval/-t conflicts with --module/-m. --module 0 selects Web module=0 (load cube); --module 1 selects module=1 (dvd bounce trail); --module 2 selects module=2 (dvd bounce direct); --module 3 selects module=3 (item pop); --module 4 selects module=4 (alpha fluids water); --module 5 selects module=5 (alpha fluids lava); --module 6 selects module=6 (panorama); --module 7 selects module=7 (footprint); --module 8 selects module=8 (squid); --module 9 selects module=9 (item bounce); --module 10 selects module=10 (grass); --module 11 selects module=11 (blocks); --module 12 selects module=12 (creeper)."
                         .into(),
                 );
             }
             _ => {
                 return Err(format!(
-                    "unknown argument {argument:?}; usage: minecraft-plus-wayland [--lock] [--module <n>]"
+                    "unknown argument {argument:?}; usage: minecraft-plus-wayland [--lock] [--module|-m <n> | --interval|-t <seconds>]"
                 )
                 .into());
             }
         }
+    }
+
+    if module.is_some() && interval_supplied {
+        return Err("--module/-m conflicts with --interval/-t".into());
     }
 
     let module = module.unwrap_or_else(|| {
@@ -375,7 +403,69 @@ fn parse_options(
         );
         selection
     });
-    Ok(StartupOptions { mode, module })
+    let module_switch_interval = interval_seconds
+        .filter(|seconds| *seconds != 0)
+        .map(Duration::from_secs);
+    Ok(StartupOptions {
+        mode,
+        module,
+        module_switch_interval,
+    })
+}
+
+fn initial_module_deadline(
+    started_at: Instant,
+    interval: Option<Duration>,
+) -> Result<Option<Instant>, &'static str> {
+    interval
+        .map(|interval| {
+            started_at
+                .checked_add(interval)
+                .ok_or("--interval is too large to schedule")
+        })
+        .transpose()
+}
+
+fn module_id_excluding(current: u8, random_slot: u8) -> u8 {
+    debug_assert!(current < 13);
+    debug_assert!(random_slot < 12);
+    if random_slot >= current {
+        random_slot + 1
+    } else {
+        random_slot
+    }
+}
+
+fn random_module_excluding(current: ModuleSelection) -> ModuleSelection {
+    let random_slot = rand::thread_rng().gen_range(0, 12);
+    ModuleSelection::from_id(module_id_excluding(current.id(), random_slot))
+        .expect("random replacement module id must remain inside the 13-entry module table")
+}
+
+fn advance_periodic_deadline(
+    deadline: Instant,
+    interval: Duration,
+    now: Instant,
+) -> Option<Instant> {
+    debug_assert!(!interval.is_zero());
+    if deadline > now {
+        return Some(deadline);
+    }
+    let elapsed_periods =
+        now.saturating_duration_since(deadline).as_nanos() / interval.as_nanos() + 1;
+    u32::try_from(elapsed_periods)
+        .ok()
+        .and_then(|periods| interval.checked_mul(periods))
+        .and_then(|elapsed| deadline.checked_add(elapsed))
+        .or_else(|| now.checked_add(interval))
+}
+
+fn earliest_deadline(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -396,7 +486,12 @@ struct RenderState {
 }
 
 impl RenderState {
-    fn new(renderer: Renderer, module_selection: ModuleSelection, lock_overlay: bool) -> Self {
+    fn new(
+        renderer: Renderer,
+        module_selection: ModuleSelection,
+        lock_overlay: bool,
+        module_started_at: Instant,
+    ) -> Self {
         Self {
             renderer,
             module: module_selection.create(),
@@ -404,9 +499,29 @@ impl RenderState {
             configured_size: None,
             module_initialized: false,
             frame_pending: false,
-            started_at: Instant::now(),
-            last_frame_at: Instant::now(),
+            started_at: module_started_at,
+            last_frame_at: module_started_at,
         }
+    }
+
+    fn prepare_module(
+        &self,
+        module_selection: ModuleSelection,
+    ) -> Result<Box<dyn Module>, Box<dyn Error>> {
+        let mut module = module_selection.create();
+        if let Some(size) = self.configured_size {
+            let context = self.renderer.context();
+            module.initialize(&context)?;
+            module.resize(&context, size);
+        }
+        Ok(module)
+    }
+
+    fn replace_module(&mut self, module: Box<dyn Module>, now: Instant) {
+        self.module = module;
+        self.module_initialized = self.configured_size.is_some();
+        self.started_at = now;
+        self.last_frame_at = now;
     }
 
     fn configure(&mut self, requested_size: (u32, u32)) -> Result<(), Box<dyn Error>> {
@@ -506,6 +621,9 @@ struct App {
     seat_state: SeatState,
     keyboards: Vec<SeatKeyboard>,
     module_selection: ModuleSelection,
+    module_started_at: Instant,
+    module_switch_interval: Option<Duration>,
+    next_module_switch: Option<Instant>,
     loop_handle: LoopHandle<'static, App>,
     deadline_timer: Option<RegistrationToken>,
     scheduled_deadline: Option<Instant>,
@@ -694,6 +812,7 @@ impl App {
             Renderer::new(connection, lock_surface.wl_surface())?,
             self.module_selection,
             true,
+            self.module_started_at,
         );
         let Mode::Lock(lock) = &mut self.mode else {
             return Ok(());
@@ -850,6 +969,71 @@ impl App {
         }
     }
 
+    fn replace_modules(
+        &mut self,
+        module_selection: ModuleSelection,
+        now: Instant,
+        qh: &QueueHandle<Self>,
+    ) -> Result<(), Box<dyn Error>> {
+        match &mut self.mode {
+            Mode::Layer(target) => {
+                let module = target.render.prepare_module(module_selection)?;
+                target.render.replace_module(module, now);
+            }
+            Mode::Lock(lock) => {
+                let replacements = lock
+                    .targets
+                    .iter()
+                    .map(|target| target.render.prepare_module(module_selection))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (target, module) in lock.targets.iter_mut().zip(replacements) {
+                    target.render.replace_module(module, now);
+                }
+                lock.redraw_all = true;
+            }
+        }
+        self.module_selection = module_selection;
+        self.module_started_at = now;
+        log::info!(
+            target: "minecraft_plus_wayland::startup",
+            "interval selected module={}",
+            module_selection.id(),
+        );
+
+        if let Mode::Layer(target) = &mut self.mode {
+            Self::render_and_schedule(
+                &mut target.render,
+                target.surface.wl_surface(),
+                qh,
+                LockVisual::Hidden,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn switch_module_if_due(
+        &mut self,
+        now: Instant,
+        qh: &QueueHandle<Self>,
+    ) -> Result<(), Box<dyn Error>> {
+        let (Some(interval), Some(deadline)) =
+            (self.module_switch_interval, self.next_module_switch)
+        else {
+            return Ok(());
+        };
+        if now < deadline
+            || matches!(&self.mode, Mode::Lock(lock) if !lock.state.can_use_lock_surfaces())
+        {
+            return Ok(());
+        }
+        let next_deadline = advance_periodic_deadline(deadline, interval, now)
+            .ok_or("cannot schedule the next module switch")?;
+        let module_selection = random_module_excluding(self.module_selection);
+        self.replace_modules(module_selection, now, qh)?;
+        self.next_module_switch = Some(next_deadline);
+        Ok(())
+    }
+
     fn after_dispatch(&mut self, connection: &Connection, qh: &QueueHandle<Self>) {
         let now = Instant::now();
         if let Mode::Lock(lock) = &mut self.mode {
@@ -862,6 +1046,17 @@ impl App {
                 lock.redraw_all = true;
                 lock.last_visual = after;
             }
+        }
+
+        if let Err(error) = self.switch_module_if_due(now, qh) {
+            if matches!(self.mode, Mode::Lock(_)) {
+                self.lock_render_fault("module switch", &*error);
+            } else {
+                log::error!(target: "minecraft_plus_wayland::startup", "module switch failed: {error}");
+                self.exit_failure = Some("module switch failed");
+                self.exit = true;
+            }
+            return;
         }
 
         let redraw = matches!(&self.mode, Mode::Lock(lock) if lock.redraw_all);
@@ -899,13 +1094,20 @@ impl App {
     }
 
     fn reschedule_deadline_timer(&mut self) {
-        let deadline = match &self.mode {
+        let now = Instant::now();
+        let lock_deadline = match &self.mode {
             Mode::Lock(lock) if lock.state.awaiting_unlock_sync() => {
-                Instant::now().checked_add(UNLOCK_FLUSH_RETRY)
+                now.checked_add(UNLOCK_FLUSH_RETRY)
             }
-            Mode::Lock(lock) => lock.state.next_deadline(Instant::now()),
+            Mode::Lock(lock) => lock.state.next_deadline(now),
             Mode::Layer(_) => None,
         };
+        let module_deadline = match &self.mode {
+            Mode::Layer(_) => self.next_module_switch,
+            Mode::Lock(lock) if lock.state.can_use_lock_surfaces() => self.next_module_switch,
+            Mode::Lock(_) => None,
+        };
+        let deadline = earliest_deadline(lock_deadline, module_deadline);
         if deadline == self.scheduled_deadline {
             return;
         }
@@ -926,12 +1128,20 @@ impl App {
         ) {
             Ok(token) => self.deadline_timer = Some(token),
             Err(error) => {
-                log::error!(target: "minecraft_plus_wayland::lock", "cannot schedule lock deadline: {error}");
-                if let Mode::Lock(lock) = &mut self.mode {
-                    lock.password.clear();
-                    lock.state.enter_fatal();
+                self.scheduled_deadline = None;
+                match &mut self.mode {
+                    Mode::Lock(lock) => {
+                        log::error!(target: "minecraft_plus_wayland::lock", "cannot schedule event-loop deadline: {error}");
+                        lock.password.clear();
+                        lock.state.enter_fatal();
+                        self.fatal_disconnect = true;
+                    }
+                    Mode::Layer(_) => {
+                        log::error!(target: "minecraft_plus_wayland::startup", "cannot schedule module-switch deadline: {error}");
+                        self.exit_failure = Some("cannot schedule module-switch deadline");
+                        self.exit = true;
+                    }
                 }
-                self.fatal_disconnect = true;
             }
         }
     }
@@ -1343,8 +1553,124 @@ fn all_outputs_presented(
 
 #[cfg(test)]
 mod tests {
-    use super::{all_outputs_presented, continuous_frame_required};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        StartupMode, advance_periodic_deadline, all_outputs_presented, continuous_frame_required,
+        earliest_deadline, initial_module_deadline, module_id_excluding, parse_options,
+    };
     use crate::lock::state::{AttemptId, LockVisual};
+
+    fn options(arguments: &[&str]) -> Result<super::StartupOptions, Box<dyn std::error::Error>> {
+        parse_options(arguments.iter().map(|argument| (*argument).to_owned()))
+    }
+
+    #[test]
+    fn module_long_and_short_options_select_a_fixed_module() {
+        for option in ["--module", "-m"] {
+            let parsed = options(&[option, "4"]).unwrap();
+            assert_eq!(parsed.module.id(), 4);
+            assert!(parsed.module_switch_interval.is_none());
+            assert!(matches!(parsed.mode, StartupMode::LayerShell));
+        }
+    }
+
+    #[test]
+    fn interval_long_and_short_options_schedule_whole_seconds() {
+        for option in ["--interval", "-t"] {
+            let parsed = options(&["--lock", option, "7"]).unwrap();
+            assert_eq!(parsed.module_switch_interval, Some(Duration::from_secs(7)));
+            assert!(matches!(parsed.mode, StartupMode::SessionLock));
+        }
+    }
+
+    #[test]
+    fn zero_or_omitted_interval_disables_switching() {
+        assert!(options(&[]).unwrap().module_switch_interval.is_none());
+        assert!(
+            options(&["--interval", "0"])
+                .unwrap()
+                .module_switch_interval
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn module_and_interval_conflict_in_either_order_including_zero() {
+        for arguments in [
+            &["--module", "3", "--interval", "5"][..],
+            &["-t", "5", "-m", "3"][..],
+            &["-m", "3", "-t", "0"][..],
+        ] {
+            assert_eq!(
+                options(arguments).unwrap_err().to_string(),
+                "--module/-m conflicts with --interval/-t"
+            );
+        }
+    }
+
+    #[test]
+    fn interval_rejects_missing_negative_and_fractional_values() {
+        for arguments in [
+            &["--interval"][..],
+            &["--interval", "-1"][..],
+            &["-t", "0.5"][..],
+        ] {
+            assert!(options(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn initial_interval_is_validated_before_runtime_setup() {
+        let start = Instant::now();
+        assert_eq!(initial_module_deadline(start, None), Ok(None));
+        assert_eq!(
+            initial_module_deadline(start, Some(Duration::from_secs(5))),
+            Ok(Some(start + Duration::from_secs(5)))
+        );
+        assert_eq!(
+            initial_module_deadline(start, Some(Duration::MAX)),
+            Err("--interval is too large to schedule")
+        );
+    }
+
+    #[test]
+    fn replacement_slot_mapping_is_uniform_and_never_repeats_current_module() {
+        for current in 0..13 {
+            let mut ids = (0..12)
+                .map(|slot| module_id_excluding(current, slot))
+                .collect::<Vec<_>>();
+            assert!(ids.iter().all(|id| *id != current && *id < 13));
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), 12);
+        }
+    }
+
+    #[test]
+    fn periodic_deadline_skips_missed_ticks_without_drift_or_catch_up() {
+        let start = Instant::now();
+        let interval = Duration::from_secs(5);
+        let deadline = start + interval;
+        assert_eq!(
+            advance_periodic_deadline(deadline, interval, start + Duration::from_secs(16)),
+            Some(start + Duration::from_secs(20))
+        );
+        assert_eq!(
+            advance_periodic_deadline(deadline, interval, deadline),
+            Some(start + Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn event_loop_uses_the_earliest_lock_or_module_deadline() {
+        let now = Instant::now();
+        let lock = now + Duration::from_secs(2);
+        let module = now + Duration::from_secs(5);
+        assert_eq!(earliest_deadline(Some(lock), Some(module)), Some(lock));
+        assert_eq!(earliest_deadline(None, Some(module)), Some(module));
+        assert_eq!(earliest_deadline(None, None), None);
+    }
 
     #[test]
     fn converged_torch_ignores_a_hidden_continuous_module() {
