@@ -1,3 +1,5 @@
 /target
 /assets/resources.zip
 /assets/mcse_web_bg.wasm
+/assets/client*.jar
+/assets/lock
