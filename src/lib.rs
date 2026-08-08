@@ -1,4 +1,5 @@
 mod app;
+pub mod lock;
 pub mod modules;
 mod renderer;
 mod resources;
