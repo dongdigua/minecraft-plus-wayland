@@ -36,7 +36,7 @@ impl LockAnimation {
 
     pub fn wants_continuous_frames(&self, visual: LockVisual, frame_time: Instant) -> bool {
         match visual {
-            LockVisual::Torch { state_id, .. } => self.torch.wants_continuous_frames(state_id),
+            LockVisual::Torch { .. } => self.torch.wants_continuous_frames(),
             _ => visual.wants_continuous_frames(frame_time),
         }
     }
@@ -51,9 +51,7 @@ impl LockAnimation {
         frame_time: Instant,
     ) {
         match visual {
-            LockVisual::Torch { mask, state_id } => self
-                .torch
-                .draw(context, encoder, target, size, mask, state_id),
+            LockVisual::Torch { mask, .. } => self.torch.draw(context, encoder, target, size, mask),
             LockVisual::Hidden => {}
             _ => self
                 .creeper

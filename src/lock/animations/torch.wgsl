@@ -1,10 +1,14 @@
 struct Uniforms {
-  camera_dir: mat2x3f, // x and y, then cross to get z
-  fov: f32,        // 垂直视场角（弧度）
+  camera_dir: mat2x3f,
+  fov: f32,
   camera_pos: vec3f,
   resolution: vec2f,
-  state_sample_index: u32,
-  mask: u32,
+  sample_index: u32,
+  _padding: u32,
+};
+
+struct PresentUniforms {
+  torch_mask: u32,
 };
 
 struct Ray {
@@ -35,25 +39,66 @@ struct Box {
   aabb: mat2x3f,
   material: Material,
   texidx: u32,
-  enabled: u32,
-  texvof: mat2x3f, // row0: +x +y +z, row1: -x -y -z
+  flags: u32,
+  texvof: mat2x3f,
 }
 
 struct VSOutput {
   @builtin(position) position: vec4f,
-  @location(0) coord: vec2f, // [-1, 1]，在 fs 里重建光线方向
+  @location(0) coord: vec2f,
 };
 
+struct CacheOutput {
+  @location(0) redstone: vec4f,
+  @location(1) copper: vec4f,
+  @location(2) soul: vec4f,
+  @location(3) torch: vec4f,
+};
+
+struct ComponentSample {
+  direct_and_emission: vec3f,
+  ambient: vec3f,
+}
+
 @group(0) @binding(0) var torchTextures: texture_2d_array<f32>;
-// layer 0 = redstone, 1 = copper, 2 = soul, 3 = torch, 4 = smooth stone
 @group(0) @binding(1) var<uniform> uniforms: Uniforms;
 
-const NUM_BOXES = 16;
+const NUM_BOXES = 18;
 @group(0) @binding(2) var<storage, read> boxes: array<Box, NUM_BOXES>;
 
-const PI = acos(-1.0);
+@group(0) @binding(3) var accumulated_hdr: texture_2d_array<f32>;
+@group(0) @binding(4) var<uniform> present_uniforms: PresentUniforms;
 
+const PI = acos(-1.0);
 const INF = 1e10;
+const NUM_RAYS_PER_COMPONENT = 4u;
+const NO_LIGHT_OWNER = 4u;
+const REDSTONE_ON_BANK = 0u;
+const REDSTONE_OFF_BANK = 1u;
+
+const OWNER_MASK = 7u;
+const DIRECT_LIGHT_FLAG = 1u << 3u;
+const REDSTONE_ON_ONLY_FLAG = 1u << 4u;
+const REDSTONE_OFF_ONLY_FLAG = 1u << 5u;
+const REDSTONE_SHEET_FLAG = 1u << 6u;
+
+fn boxLightOwner(flags: u32) -> u32 {
+  let encoded = flags & OWNER_MASK;
+  if encoded == 0u {
+    return NO_LIGHT_OWNER;
+  }
+  return encoded - 1u;
+}
+
+fn boxEnabledInBank(flags: u32, bank: u32) -> bool {
+  if (flags & REDSTONE_ON_ONLY_FLAG) != 0u {
+    return bank == REDSTONE_ON_BANK;
+  }
+  if (flags & REDSTONE_OFF_ONLY_FLAG) != 0u {
+    return bank == REDSTONE_OFF_BANK;
+  }
+  return true;
+}
 
 fn hitAABB(ray: Ray, aabb: mat2x3f) -> Hit {
   let invD = 1.0 / ray.rd;
@@ -67,83 +112,80 @@ fn hitAABB(ray: Ray, aabb: mat2x3f) -> Hit {
   let tFar = min(min(tmax.x, tmax.y), tmax.z);
 
   if (tFar + 1e-5 < max(tNear, 0.0)) {
-    return Hit(1e10, vec3f(0.0), vec3f(0.0), vec4f(0.0), Material(0, 0));
+    return Hit(INF, vec3f(0.0), vec3f(0.0), vec4f(0.0), Material(0.0, 0.0));
   }
 
   let eps = 1e-4;
-
   let isNear = tNear >= 0.0;
   let t = select(tFar, tNear, isNear);
   let p = ray.ro + ray.rd * (t - eps);
-  //let p = ray.ro + ray.rd * t;
 
-  // 用命中点位置反推法线，对零厚度薄片也健壮
   let onMin = abs(p - aabb[0]) < vec3f(eps);
   let onMax = abs(p - aabb[1]) < vec3f(eps);
-  // 零厚度轴：p 同时落在 min 和 max 面上
   let thin = onMin & onMax;
-  // 对零厚度轴，法线朝向光线来向（入口）或去向（出口）
   let thinNormal = select(sign(ray.rd), -sign(ray.rd), isNear);
   var normal = vec3f(0.0);
   normal = select(normal, thinNormal, thin);
-  // 对有厚度的轴，min 面法线为 -1，max 面法线为 +1
   normal = select(normal, vec3f(-1.0), onMin & !thin);
   normal = select(normal, vec3f(1.0), onMax & !thin);
 
-  return Hit(t, p, normal, vec4f(0.0), Material(0, 0));
+  return Hit(t, p, normal, vec4f(0.0), Material(0.0, 0.0));
 }
 
-fn calculateCollision(ray: Ray, directLight: bool) -> Hit {
-  var nearestHit = Hit(1e10, vec3f(0), vec3f(0), vec4f(0), Material(0, 0));
-  var color = vec4f(0);
+fn calculateCollision(ray: Ray, directLight: bool, bank: u32, component: u32) -> Hit {
+  var nearestHit = Hit(INF, vec3f(0.0), vec3f(0.0), vec4f(0.0), Material(0.0, 0.0));
 
   for (var i = 0u; i < NUM_BOXES; i = i + 1u) {
-    if boxes[i].enabled == 0u {
+    let box = boxes[i];
+    if !boxEnabledInBank(box.flags, bank) {
       continue;
     }
-    let hit = hitAABB(ray, boxes[i].aabb);
+
+    let hit = hitAABB(ray, box.aabb);
     let a = abs(hit.normal);
     let u_axis = vec3f(a.y + a.z, a.x, 0.0);
     let v_axis = vec3f(0.0, a.z, a.x + a.y);
 
     let axis_idx = u32(dot(abs(hit.normal), vec3f(0.0, 1.0, 2.0)));
     let sign_idx = u32((1.0 - dot(hit.normal, vec3f(1.0))) * 0.5);
-
-    let off = vec2f(0.0, boxes[i].texvof[sign_idx][axis_idx]);
+    let off = vec2f(0.0, box.texvof[sign_idx][axis_idx]);
     let uv = hit.p * mat2x3f(u_axis, v_axis) + off;
+    let texUV = vec2u(floor(fract(uv) * 16.0));
 
-    let texUV = vec2u((floor(fract(uv) * 16)));
+    var lit = textureLoad(torchTextures, texUV, box.texidx, 0u);
+    let owner = boxLightOwner(box.flags);
+    let belongsToComponent = owner == component;
 
-    var lit = textureLoad(torchTextures, texUV, boxes[i].texidx, 0u);
-
-    // 红石火把在直接光采样下的特判，侧面薄片不遮挡火把芯，统一火把芯的直接光照逻辑
-    if directLight {
-      if 1 <= i && i <= 4 && texUV.y > 7 {
-        lit.a = 0;
-      } else if i == 5 {
-        lit += vec4f(1, 0, 0, 0);
+    // Preserve the hand-tuned redstone direct-light special case from torch/shader.wgsl:
+    // visual sheets do not shadow the sampled head, and the head receives the red boost.
+    if directLight && bank == REDSTONE_ON_BANK {
+      if (box.flags & REDSTONE_SHEET_FLAG) != 0u && belongsToComponent && texUV.y > 7u {
+        lit.a = 0.0;
+      } else if (box.flags & DIRECT_LIGHT_FLAG) != 0u && belongsToComponent && owner == 0u {
+        lit += vec4f(1.0, 0.0, 0.0, 0.0);
       }
     }
 
     if hit.t < nearestHit.t && lit.a > 0.5 {
       nearestHit = hit;
       nearestHit.color = lit;
-      nearestHit.material = boxes[i].material;
+      let effectiveLight = select(0.0, box.material.light_level, belongsToComponent);
+      nearestHit.material = Material(effectiveLight, box.material.smoothness);
     }
   }
   return nearestHit;
 }
 
 fn rand(state: ptr<function, u32>) -> f32 {
-  *state = *state * 747796405 + 2891336453;
-  var result = ((*state >> ((*state >> 28) + 4)) ^ *state) * 277803737;
-  result = (result >> 22) ^ result;
+  *state = *state * 747796405u + 2891336453u;
+  var result = ((*state >> ((*state >> 28u) + 4u)) ^ *state) * 277803737u;
+  result = (result >> 22u) ^ result;
   return f32(result) / 4294967296.0;
 }
 
 fn randNorm(state: ptr<function, u32>) -> f32 {
   let theta = 2.0 * PI * rand(state);
-  let u = max(rand(state), 1e-10);  // 防止 log(0) = -inf
+  let u = max(rand(state), 1e-10);
   let rho = sqrt(-2.0 * log(u));
   return rho * cos(theta);
 }
@@ -154,31 +196,30 @@ fn randDir(norm: vec3f, state: ptr<function, u32>) -> vec3f {
 }
 
 fn ambientLight(ray: Ray) -> vec4f {
-  let skyZenith = vec3f(0.47, 0.65, 1);
-  let skyHorizon = vec3f(1);
-  let groundColor = vec3f(0);
-  let skyGradient = pow(smoothstep(0, 0.4, dot(ray.rd, vec3f(0, 0, 1))), 0.35);
+  let skyZenith = vec3f(0.47, 0.65, 1.0);
+  let skyHorizon = vec3f(1.0);
+  let groundColor = vec3f(0.0);
+  let skyGradient = pow(smoothstep(0.0, 0.4, dot(ray.rd, vec3f(0.0, 0.0, 1.0))), 0.35);
   let sky = mix(skyHorizon, skyZenith, skyGradient);
-  return vec4f(select(groundColor, sky, ray.rd.z > 0), 1);
+  return vec4f(select(groundColor, sky, ray.rd.z > 0.0), 1.0);
 }
 
-fn sampleDirectLight(rngState: ptr<function, u32>) -> LightSample {
-  var selectedIdx = u32(rand(rngState) * 4) * 2 + 5;
-  let selected = boxes[selectedIdx];
+fn sampleDirectLight(component: u32, rngState: ptr<function, u32>) -> LightSample {
+  let lightSourceIndices = array<u32, 4>(5u, 9u, 11u, 13u);
+  let selected = boxes[lightSourceIndices[component]];
 
   let faceNormals = array<vec3f, 6>(
-    vec3f(-1,  0,  0), vec3f( 1,  0,  0),
-    vec3f( 0, -1,  0), vec3f( 0,  1,  0),
-    vec3f( 0,  0, -1), vec3f( 0,  0,  1),
+    vec3f(-1.0,  0.0,  0.0), vec3f( 1.0,  0.0,  0.0),
+    vec3f( 0.0, -1.0,  0.0), vec3f( 0.0,  1.0,  0.0),
+    vec3f( 0.0,  0.0, -1.0), vec3f( 0.0,  0.0,  1.0),
   );
-  let faceIdx5 = u32(rand(rngState) * 5);
-  let faceIdx = select(faceIdx5, faceIdx5 + 1u, faceIdx5 >= 4u); // skip bottom face (index 4)
+  let faceIdx5 = u32(rand(rngState) * 5.0);
+  let faceIdx = select(faceIdx5, faceIdx5 + 1u, faceIdx5 >= 4u);
   let collapseWhichDim = faceIdx / 2u;
   let chooseMsOrMx = faceIdx % 2u;
 
   let aabb = selected.aabb;
   let fixedCoord = aabb[chooseMsOrMx][collapseWhichDim];
-
   let dim0 = (collapseWhichDim + 1u) % 3u;
   let dim1 = (collapseWhichDim + 2u) % 3u;
 
@@ -188,100 +229,153 @@ fn sampleDirectLight(rngState: ptr<function, u32>) -> LightSample {
   point[dim1] = mix(aabb[0][dim1], aabb[1][dim1], rand(rngState));
 
   let area = abs((aabb[1][dim0] - aabb[0][dim0]) * (aabb[1][dim1] - aabb[0][dim1]));
-  var pdf = 0.25 / 5;
+  var pdf = 1.0 / 5.0;
   pdf /= area;
   return LightSample(point, faceNormals[faceIdx], pdf);
 }
 
-fn sampleSkyLight(hit: Hit, rngState: ptr<function, u32>) -> vec3f {
-    let envRay = Ray(hit.p + hit.normal * 1e-5, randDir(hit.normal, rngState));
-    let envHit = calculateCollision(envRay, false);
+fn sampleSkyLight(hit: Hit, rngState: ptr<function, u32>, bank: u32, component: u32) -> vec3f {
+  let envRay = Ray(hit.p + hit.normal * 1e-5, randDir(hit.normal, rngState));
+  let envHit = calculateCollision(envRay, false, bank, component);
 
-    if envHit.t < 1e5 {
-      return vec3f(0.0);
-    }
+  if envHit.t < 1e5 {
+    return vec3f(0.0);
+  }
 
-    let environmentRadiance = ambientLight(envRay).rgb;
-    // randDir 是 cosine-weighted：
-    // 所以不需要再乘 cosine 或除 PI。
-    return hit.color.rgb * environmentRadiance;
+  let environmentRadiance = ambientLight(envRay).rgb;
+  return hit.color.rgb * environmentRadiance;
 }
 
-fn trace(rray: Ray, rngState: ptr<function, u32>) -> vec4f {
+// This keeps the authoritative hit epsilon, direct ray origin, five-face sampling, geometric
+// term, redstone visibility special case, and sky sampler. The cache decomposition deliberately
+// stores ambient separately so four independently switchable direct/emissive components can share
+// one all-off environment term at presentation time.
+fn traceComponent(
+  rray: Ray,
+  component: u32,
+  bank: u32,
+  storeAmbient: bool,
+  rngState: ptr<function, u32>,
+) -> ComponentSample {
   var ray = rray;
-  var light = vec4f(0);
+  var directAndEmission = vec3f(0.0);
 
-  var hit = calculateCollision(ray, false);
-
+  let hit = calculateCollision(ray, false, bank, component);
   if hit.t > 1e5 {
-    return vec4f(0, 0, 0, 1);
+    return ComponentSample(vec3f(0.0), vec3f(0.0));
   }
 
-  if hit.material.light_level > 0.5 {
-    light += hit.material.light_level * hit.color * 10;
-    return light;
-  }
-
-  ray.ro = hit.p;
-
-  let directLight = sampleDirectLight(rngState);
-
-  ray.rd = normalize(directLight.pos - ray.ro);
-  let shadowHit = calculateCollision(ray, true);
-
-  if length(shadowHit.p - directLight.pos) < 1e-3 {
-    let emittedLight = shadowHit.material.light_level * hit.color * 10;
-    let lightStrength = max(dot(hit.normal, ray.rd), 0.0);
-    let G = max(dot(directLight.normal, -ray.rd), 0.0) / (length(hit.p - shadowHit.p) * length(hit.p - shadowHit.p));
-    light += emittedLight * shadowHit.color * lightStrength * G / PI / directLight.pdf;
+  let hitActiveEmitter = hit.material.light_level > 0.5;
+  if hitActiveEmitter {
+    directAndEmission += (hit.material.light_level * hit.color * 10.0).rgb;
   } else {
-    light += vec4f(sampleSkyLight(hit, rngState), 0);
+    ray.ro = hit.p;
+    let directLight = sampleDirectLight(component, rngState);
+    ray.rd = normalize(directLight.pos - ray.ro);
+    let shadowHit = calculateCollision(ray, true, bank, component);
+
+    if length(shadowHit.p - directLight.pos) < 1e-3 {
+      let emittedLight = shadowHit.material.light_level * hit.color * 10.0;
+      let lightStrength = max(dot(hit.normal, ray.rd), 0.0);
+      let distance = length(hit.p - shadowHit.p);
+      let G = max(dot(directLight.normal, -ray.rd), 0.0) / (distance * distance);
+      directAndEmission +=
+        (emittedLight * shadowHit.color * lightStrength * G / PI / directLight.pdf).rgb;
+    }
   }
-  return vec4f(light.rgb, 1);
+
+  var ambient = vec3f(0.0);
+  if storeAmbient {
+    ambient = sampleSkyLight(hit, rngState, bank, component);
+  }
+  return ComponentSample(directAndEmission, ambient);
 }
 
 @vertex
-fn vs(
-  @builtin(vertex_index) vertexIndex : u32
-) -> VSOutput {
+fn vs(@builtin(vertex_index) vertexIndex: u32) -> VSOutput {
   let pos = array(
     vec2f(-1.0, -1.0),
-    vec2f(3.0,  -1.0),
+    vec2f(3.0, -1.0),
     vec2f(-1.0, 3.0),
   );
-
   let xy = pos[vertexIndex];
-  var vsOutput: VSOutput;
-  vsOutput.position = vec4f(xy, 0.0, 1.0); // [-1,1]
-  vsOutput.coord = xy;
-  return vsOutput;
+  var output: VSOutput;
+  output.position = vec4f(xy, 0.0, 1.0);
+  output.coord = xy;
+  return output;
 }
 
-const NUM_RAYS = 4;
+fn renderComponent(
+  cameraRay: Ray,
+  pixel: u32,
+  component: u32,
+  bank: u32,
+  ambientChannel: u32,
+) -> vec4f {
+  var rngState = pixel ^
+    (uniforms.sample_index * 3266489917u) ^
+    ((component + 1u) * 2246822519u);
+  var directAndEmission = vec3f(0.0);
+  var ambient = vec3f(0.0);
+  let storeAmbient = ambientChannel < 3u;
+
+  for (var i = 0u; i < NUM_RAYS_PER_COMPONENT; i = i + 1u) {
+    let sample = traceComponent(cameraRay, component, bank, storeAmbient, &rngState);
+    directAndEmission += sample.direct_and_emission;
+    ambient += sample.ambient;
+  }
+
+  directAndEmission /= f32(NUM_RAYS_PER_COMPONENT);
+  ambient /= f32(NUM_RAYS_PER_COMPONENT);
+  var packedAmbient = 0.0;
+  if storeAmbient {
+    packedAmbient = ambient[ambientChannel];
+  }
+  return vec4f(directAndEmission, packedAmbient);
+}
 
 @fragment
-fn fs(fsIn: VSOutput) -> @location(0) vec4f {
+fn fs_accumulate(fsIn: VSOutput) -> CacheOutput {
   let aspect = uniforms.resolution.x / uniforms.resolution.y;
   let d = 1.0 / tan(uniforms.fov / 2.0);
   let v = normalize(vec3f(fsIn.coord.x * aspect, fsIn.coord.y, d));
   let camera_z = -normalize(cross(uniforms.camera_dir[0], uniforms.camera_dir[1]));
   let rd = v.x * uniforms.camera_dir[0] + v.y * uniforms.camera_dir[1] + v.z * camera_z;
+  let cameraRay = Ray(uniforms.camera_pos, rd);
+  let pixel = u32(fsIn.position.y) * u32(uniforms.resolution.x) + u32(fsIn.position.x);
 
-  let pixel = u32(fsIn.position.y * uniforms.resolution.x + fsIn.position.x);
-  var rngState = pixel ^ (uniforms.mask * 2246822519u) ^ (uniforms.state_sample_index * 3266489917u);
-  var light = vec4f(0);
-
-  for (var i = 0u; i < NUM_RAYS; i = i + 1u) {
-    light += trace(Ray(uniforms.camera_pos, rd), &rngState);
-  }
-
-  return light / f32(NUM_RAYS);
+  // Redstone uses its lit cross-sheet bank. The other three components use the MC-style
+  // redstone-off bank; their alpha channels carry the shared all-off sky RGB.
+  return CacheOutput(
+    renderComponent(cameraRay, pixel, 0u, REDSTONE_ON_BANK, 3u),
+    renderComponent(cameraRay, pixel, 1u, REDSTONE_OFF_BANK, 0u),
+    renderComponent(cameraRay, pixel, 2u, REDSTONE_OFF_BANK, 1u),
+    renderComponent(cameraRay, pixel, 3u, REDSTONE_OFF_BANK, 2u),
+  );
 }
 
-@group(0) @binding(3) var accumulated_hdr: texture_2d<f32>;
+fn tonemappedColor(position: vec4f) -> vec3f {
+  let coord = vec2i(position.xy);
+  let redstone = textureLoad(accumulated_hdr, coord, 0, 0);
+  let copper = textureLoad(accumulated_hdr, coord, 1, 0);
+  let soul = textureLoad(accumulated_hdr, coord, 2, 0);
+  let torch = textureLoad(accumulated_hdr, coord, 3, 0);
+  let mask = present_uniforms.torch_mask;
 
-fn tonemapped_color(position: vec4f) -> vec3f {
-  let color = textureLoad(accumulated_hdr, vec2i(position.xy), 0).rgb;
+  var color = vec3f(copper.a, soul.a, torch.a);
+  if (mask & 1u) != 0u {
+    color += redstone.rgb;
+  }
+  if (mask & 2u) != 0u {
+    color += copper.rgb;
+  }
+  if (mask & 4u) != 0u {
+    color += soul.rgb;
+  }
+  if (mask & 8u) != 0u {
+    color += torch.rgb;
+  }
+
   let lum = dot(color, vec3f(0.2126, 0.7152, 0.0722));
   return color / (1.0 + lum);
 }
@@ -293,11 +387,9 @@ fn srgbToLinear(channel: f32) -> f32 {
   return pow((channel + 0.055) / 1.055, 2.4);
 }
 
-// The Web demo writes tone-mapped numeric RGB to an UNORM canvas. Compensate only when the
-// surface itself performs an automatic sRGB encode, matching the other Web-derived modules.
 @fragment
 fn fs_present_srgb(@builtin(position) position: vec4f) -> @location(0) vec4f {
-  let color = tonemapped_color(position);
+  let color = tonemappedColor(position);
   return vec4f(
     srgbToLinear(color.r),
     srgbToLinear(color.g),
@@ -308,5 +400,5 @@ fn fs_present_srgb(@builtin(position) position: vec4f) -> @location(0) vec4f {
 
 @fragment
 fn fs_present_unorm(@builtin(position) position: vec4f) -> @location(0) vec4f {
-  return vec4f(tonemapped_color(position), 1.0);
+  return vec4f(tonemappedColor(position), 1.0);
 }

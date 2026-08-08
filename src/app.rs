@@ -622,7 +622,14 @@ impl App {
             render.frame_pending = true;
         }
         let outcome = render.render(visual, frame_time)?;
-        if continuous && render.frame_pending && outcome == RenderOutcome::Skipped {
+        // A converged opaque overlay normally has no frame chain. If a one-shot state redraw is
+        // skipped because the surface is temporarily unavailable, attach a callback to an empty
+        // commit so the new mask/visual is retried instead of being lost permanently.
+        if outcome == RenderOutcome::Skipped {
+            if !render.frame_pending {
+                surface.frame(qh, FrameCallbackData(surface.clone()));
+                render.frame_pending = true;
+            }
             surface.commit();
         }
         Ok(RenderReport {

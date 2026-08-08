@@ -18,12 +18,13 @@ const EMBEDDED_ARCHIVE: &[u8] = include_bytes!("../assets/resources.zip");
 const EMBEDDED_WEB_WASM: &[u8] = include_bytes!("../assets/mcse_web_bg.wasm");
 
 #[cfg(feature = "embed-assets")]
-const EMBEDDED_TORCH_TEXTURES: [&[u8]; 5] = [
+const EMBEDDED_TORCH_TEXTURES: [&[u8]; 6] = [
     include_bytes!("../assets/lock/torch/redstone_torch.png"),
     include_bytes!("../assets/lock/torch/copper_torch.png"),
     include_bytes!("../assets/lock/torch/soul_torch.png"),
     include_bytes!("../assets/lock/torch/torch.png"),
     include_bytes!("../assets/lock/torch/smooth_stone.png"),
+    include_bytes!("../assets/lock/torch/redstone_torch_off.png"),
 ];
 
 #[derive(Clone)]
@@ -120,17 +121,19 @@ pub(crate) fn load_web_wasm() -> Result<Vec<u8>, Box<dyn Error>> {
     }
 }
 
-/// Load the five fixed torch-scene texture layers in redstone/copper/soul/torch/stone order.
-pub(crate) fn load_torch_textures() -> Result<[image::RgbaImage; 5], Box<dyn Error>> {
-    const NAMES: [&str; 5] = [
+/// Load the six fixed torch-scene texture layers in
+/// redstone/copper/soul/torch/stone/redstone-off order.
+pub(crate) fn load_torch_textures() -> Result<[image::RgbaImage; 6], Box<dyn Error>> {
+    const NAMES: [&str; 6] = [
         "redstone_torch.png",
         "copper_torch.png",
         "soul_torch.png",
         "torch.png",
         "smooth_stone.png",
+        "redstone_torch_off.png",
     ];
     let embedded = embedded_torch_textures();
-    let sources: [AssetSource; 5] = std::array::from_fn(|index| {
+    let sources: [AssetSource; 6] = std::array::from_fn(|index| {
         select_source(
             None,
             configured_asset_path(&format!("{TORCH_ASSETS_RELATIVE}/{}", NAMES[index])),
@@ -154,7 +157,7 @@ pub(crate) fn load_torch_textures() -> Result<[image::RgbaImage; 5], Box<dyn Err
         .collect::<Result<Vec<_>, _>>()?;
     images
         .try_into()
-        .map_err(|_| "torch texture table must contain exactly five images".into())
+        .map_err(|_| "torch texture table must contain exactly six images".into())
 }
 
 fn configured_path(variable: &str) -> Option<PathBuf> {
@@ -203,12 +206,12 @@ fn embedded_web_wasm() -> Option<&'static [u8]> {
 }
 
 #[cfg(feature = "embed-assets")]
-fn embedded_torch_textures() -> Option<[&'static [u8]; 5]> {
+fn embedded_torch_textures() -> Option<[&'static [u8]; 6]> {
     Some(EMBEDDED_TORCH_TEXTURES)
 }
 
 #[cfg(not(feature = "embed-assets"))]
-fn embedded_torch_textures() -> Option<[&'static [u8]; 5]> {
+fn embedded_torch_textures() -> Option<[&'static [u8]; 6]> {
     None
 }
 
