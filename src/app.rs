@@ -1,15 +1,27 @@
-use std::{env, error::Error, time::Instant};
+use std::{
+    env,
+    error::Error,
+    time::{Duration, Instant},
+};
 
 use rand::Rng;
-use smithay_client_toolkit::reexports::client::{
-    Connection, QueueHandle,
-    globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_seat, wl_surface},
-};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
     delegate_registry,
     output::{OutputHandler, OutputState},
+    reexports::{
+        calloop::{
+            EventLoop, LoopHandle, RegistrationToken,
+            channel::{self, Event as ChannelEvent},
+            timer::{TimeoutAction, Timer},
+        },
+        calloop_wayland_source::WaylandSource,
+        client::{
+            Connection, Dispatch, QueueHandle,
+            globals::registry_queue_init,
+            protocol::{wl_callback, wl_keyboard, wl_output, wl_seat, wl_surface},
+        },
+    },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
@@ -30,6 +42,14 @@ use smithay_client_toolkit::{
 };
 
 use crate::{
+    lock::{
+        animations::TriangleAnimation,
+        auth::pam::PamAuthenticator,
+        identity::TrustedIdentity,
+        secret::{LockedSecret, SecretError, disable_process_dumps},
+        state::{AttemptId, AuthDecision, LockState, LockVisual},
+        worker::{AuthReply, AuthRequest, AuthWorker},
+    },
     modules::{
         AlphaFluidVariant, AlphaFluidsModule, BlocksModule, CreeperModule, DvdBounceModule,
         DvdBounceVariant, FootprintModule, FrameInfo, GrassModule, ItemBounceModule, ItemPopModule,
@@ -42,6 +62,7 @@ const FALLBACK_SIZE: RenderSize = RenderSize {
     width: 1280,
     height: 720,
 };
+const UNLOCK_FLUSH_RETRY: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Copy, Debug)]
 enum StartupMode {
@@ -125,20 +146,50 @@ struct StartupOptions {
     module: ModuleSelection,
 }
 
+struct LockSetup {
+    worker: AuthWorker,
+    replies: channel::Channel<AuthReply>,
+    password: LockedSecret,
+}
+
+impl LockSetup {
+    fn new() -> Result<Self, Box<dyn Error>> {
+        let identity = TrustedIdentity::discover()?;
+        let dump_protection = disable_process_dumps()?;
+        let authenticator = PamAuthenticator::new(dump_protection);
+        let (reply_sender, replies) = channel::sync_channel(1);
+        let worker = AuthWorker::spawn_pam(identity.into_username(), authenticator, reply_sender)?;
+        Ok(Self {
+            worker,
+            replies,
+            password: LockedSecret::new()?,
+        })
+    }
+}
+
 pub fn run() -> Result<(), Box<dyn Error>> {
     let startup = parse_startup_options()?;
-    let startup_mode = startup.mode;
-    let module_selection = startup.module;
+    // Identity, dump hardening, worker construction and the editable secret all succeed before the
+    // client requests a session lock.
+    let mut lock_setup = match startup.mode {
+        StartupMode::LayerShell => None,
+        StartupMode::SessionLock => Some(LockSetup::new()?),
+    };
+
     let connection = Connection::connect_to_env()?;
-    let (globals, mut event_queue) = registry_queue_init(&connection)?;
+    let (globals, event_queue) = registry_queue_init(&connection)?;
     let qh = event_queue.handle();
+    let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
+    let loop_handle = event_loop.handle();
 
     let compositor_state = CompositorState::bind(&globals, &qh)?;
     let output_state = OutputState::new(&globals, &qh);
     let registry_state = RegistryState::new(&globals);
     let seat_state = SeatState::new(&globals, &qh);
 
-    let (mode, session_lock_state) = match startup_mode {
+    let outputs = output_state.outputs().collect::<Vec<_>>();
+    let mut lock_replies = None;
+    let (mode, session_lock_state) = match startup.mode {
         StartupMode::LayerShell => {
             let layer_shell = LayerShell::bind(&globals, &qh)?;
             let surface = compositor_state.create_surface(&qh);
@@ -153,10 +204,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             layer.set_size(0, 0);
             layer.set_exclusive_zone(-1);
             layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-
             let render = RenderState::new(
                 Renderer::new(&connection, layer.wl_surface())?,
-                module_selection,
+                startup.module,
+                false,
             );
             (
                 Mode::Layer(Box::new(LayerTarget {
@@ -167,32 +218,27 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             )
         }
         StartupMode::SessionLock => {
-            let session_lock_state = SessionLockState::new(&globals, &qh);
-            let session_lock = session_lock_state.lock(&qh)?;
-            let outputs = output_state.outputs().collect::<Vec<_>>();
             if outputs.is_empty() {
                 return Err("session-lock requires at least one Wayland output".into());
             }
-
-            let mut targets = Vec::with_capacity(outputs.len());
-            for output in outputs {
-                let surface = compositor_state.create_surface(&qh);
-                let lock_surface = session_lock.create_lock_surface(surface, &output, &qh);
-                let render = RenderState::new(
-                    Renderer::new(&connection, lock_surface.wl_surface())?,
-                    module_selection,
-                );
-                targets.push(LockTarget {
-                    render,
-                    output,
-                    surface: lock_surface,
-                });
-            }
-
+            let session_lock_state = SessionLockState::new(&globals, &qh);
+            let session_lock = session_lock_state.lock(&qh)?;
+            let LockSetup {
+                worker,
+                replies,
+                password,
+            } = lock_setup.take().expect("lock setup exists in lock mode");
+            lock_replies = Some(replies);
             (
                 Mode::Lock(LockTargets {
-                    targets,
+                    targets: Vec::with_capacity(outputs.len()),
                     session_lock,
+                    state: LockState::new(),
+                    password,
+                    worker,
+                    unlock_sync: None,
+                    redraw_all: false,
+                    last_visual: LockVisual::Hidden,
                 }),
                 Some(session_lock_state),
             )
@@ -202,22 +248,80 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let mut app = App {
         mode,
         _session_lock_state: session_lock_state,
-        _compositor_state: compositor_state,
+        compositor_state,
         output_state,
         registry_state,
         seat_state,
-        keyboard: None,
+        keyboards: Vec::new(),
+        module_selection: startup.module,
+        loop_handle: loop_handle.clone(),
+        deadline_timer: None,
+        scheduled_deadline: None,
         exit: false,
+        exit_failure: None,
+        fatal_disconnect: false,
     };
 
-    if let Mode::Layer(target) = &app.mode {
+    if matches!(app.mode, Mode::Lock(_)) {
+        for output in outputs {
+            if let Err(error) = app.add_lock_output(&connection, &qh, output) {
+                log::error!(target: "minecraft_plus_wayland::lock", "cannot cover initial output: {error}");
+                app.clear_editable_secret();
+                // Do not normally drop a requested session-lock object before locked/finished.
+                std::process::exit(1);
+            }
+        }
+    } else if let Mode::Layer(target) = &app.mode {
         target.surface.commit();
     }
 
-    while !app.exit {
-        event_queue.blocking_dispatch(&mut app)?;
+    if let Some(replies) = lock_replies
+        && let Err(error) = event_loop
+            .handle()
+            .insert_source(replies, |event, &mut (), app| match event {
+                ChannelEvent::Msg(reply) => app.handle_auth_reply(reply),
+                ChannelEvent::Closed => app.handle_worker_closed(),
+            })
+    {
+        log::error!(target: "minecraft_plus_wayland::lock", "cannot install authentication result source: {error}");
+        app.clear_editable_secret();
+        std::process::exit(1);
     }
 
+    if let Err(error) = WaylandSource::new(connection.clone(), event_queue).insert(loop_handle) {
+        if matches!(app.mode, Mode::Lock(_)) {
+            log::error!(target: "minecraft_plus_wayland::lock", "cannot install Wayland event source: {error}");
+            app.clear_editable_secret();
+            std::process::exit(1);
+        }
+        return Err(error.into());
+    }
+
+    while !app.exit {
+        if let Err(error) = event_loop.dispatch(None, &mut app) {
+            if matches!(app.mode, Mode::Lock(_)) {
+                log::error!(target: "minecraft_plus_wayland::lock", "event loop dispatch failed: {error}");
+                app.clear_editable_secret();
+                std::process::exit(1);
+            }
+            return Err(error.into());
+        }
+        // A wl_display.sync Done callback can mark authenticated shutdown while dispatching.
+        // Do not run another render/timer pass against lock surfaces that unlock_and_destroy has
+        // already invalidated.
+        if app.exit {
+            break;
+        }
+        app.after_dispatch(&connection, &qh);
+        if app.fatal_disconnect {
+            app.clear_editable_secret();
+            std::process::exit(1);
+        }
+    }
+    log::info!(target: "minecraft_plus_wayland::lock", "event loop stopped; tearing down client resources");
+    if let Some(message) = app.exit_failure {
+        return Err(message.into());
+    }
     Ok(())
 }
 
@@ -271,13 +375,13 @@ fn parse_options(
         );
         selection
     });
-
     Ok(StartupOptions { mode, module })
 }
 
 struct RenderState {
     renderer: Renderer,
     module: Box<dyn Module>,
+    overlay: Option<TriangleAnimation>,
     configured_size: Option<RenderSize>,
     module_initialized: bool,
     frame_pending: bool,
@@ -286,10 +390,11 @@ struct RenderState {
 }
 
 impl RenderState {
-    fn new(renderer: Renderer, module_selection: ModuleSelection) -> Self {
+    fn new(renderer: Renderer, module_selection: ModuleSelection, lock_overlay: bool) -> Self {
         Self {
             renderer,
             module: module_selection.create(),
+            overlay: lock_overlay.then(TriangleAnimation::new),
             configured_size: None,
             module_initialized: false,
             frame_pending: false,
@@ -312,24 +417,24 @@ impl RenderState {
                 requested_size.1
             },
         };
-
         self.renderer.configure(size)?;
         self.configured_size = Some(size);
-
         let context = self.renderer.context();
         if !self.module_initialized {
             self.module.initialize(&context)?;
             self.module_initialized = true;
         }
         self.module.resize(&context, size);
+        if let Some(overlay) = &mut self.overlay {
+            overlay.ensure_initialized(&context);
+        }
         Ok(())
     }
 
-    fn render(&mut self) -> Result<RenderOutcome, Box<dyn Error>> {
+    fn render(&mut self, visual: LockVisual) -> Result<RenderOutcome, Box<dyn Error>> {
         let Some(size) = self.configured_size else {
             return Ok(RenderOutcome::Skipped);
         };
-
         let now = Instant::now();
         let frame = FrameInfo {
             elapsed: now.duration_since(self.started_at),
@@ -338,7 +443,11 @@ impl RenderState {
         };
         self.last_frame_at = now;
         self.module.update(frame);
-        self.renderer.render(self.module.as_mut(), frame)
+        self.renderer.render(
+            self.module.as_mut(),
+            frame,
+            self.overlay.as_mut().map(|overlay| (overlay, visual)),
+        )
     }
 }
 
@@ -348,14 +457,22 @@ struct LayerTarget {
 }
 
 struct LockTarget {
+    // Renderer must be dropped before the protocol surface it references.
     render: RenderState,
     output: wl_output::WlOutput,
     surface: SessionLockSurface,
+    green_presented: Option<AttemptId>,
 }
 
 struct LockTargets {
     targets: Vec<LockTarget>,
     session_lock: SessionLock,
+    state: LockState,
+    password: LockedSecret,
+    worker: AuthWorker,
+    unlock_sync: Option<Box<wl_callback::WlCallback>>,
+    redraw_all: bool,
+    last_visual: LockVisual,
 }
 
 enum Mode {
@@ -363,15 +480,27 @@ enum Mode {
     Lock(LockTargets),
 }
 
+struct SeatKeyboard {
+    seat: wl_seat::WlSeat,
+    keyboard: wl_keyboard::WlKeyboard,
+    repeat_allowed: bool,
+}
+
 struct App {
     mode: Mode,
     _session_lock_state: Option<SessionLockState>,
-    _compositor_state: CompositorState,
+    compositor_state: CompositorState,
     output_state: OutputState,
     registry_state: RegistryState,
     seat_state: SeatState,
-    keyboard: Option<wl_keyboard::WlKeyboard>,
+    keyboards: Vec<SeatKeyboard>,
+    module_selection: ModuleSelection,
+    loop_handle: LoopHandle<'static, App>,
+    deadline_timer: Option<RegistrationToken>,
+    scheduled_deadline: Option<Instant>,
     exit: bool,
+    exit_failure: Option<&'static str>,
+    fatal_disconnect: bool,
 }
 
 impl App {
@@ -384,7 +513,13 @@ impl App {
             return Ok(());
         };
         target.render.configure(configure.new_size)?;
-        Self::render_and_schedule(&mut target.render, target.surface.wl_surface(), qh)
+        Self::render_and_schedule(
+            &mut target.render,
+            target.surface.wl_surface(),
+            qh,
+            LockVisual::Hidden,
+        )?;
+        Ok(())
     }
 
     fn configure_lock(
@@ -396,6 +531,7 @@ impl App {
         let Mode::Lock(lock) = &mut self.mode else {
             return Ok(());
         };
+        let visual = lock.state.visual(Instant::now());
         let Some(target) = lock
             .targets
             .iter_mut()
@@ -404,7 +540,10 @@ impl App {
             return Ok(());
         };
         target.render.configure(configure.new_size)?;
-        Self::render_and_schedule(&mut target.render, target.surface.wl_surface(), qh)
+        let outcome =
+            Self::render_and_schedule(&mut target.render, target.surface.wl_surface(), qh, visual)?;
+        Self::record_green_present(target, visual, outcome);
+        Ok(())
     }
 
     fn render_surface(
@@ -414,9 +553,15 @@ impl App {
     ) -> Result<(), Box<dyn Error>> {
         match &mut self.mode {
             Mode::Layer(target) if target.surface.wl_surface() == surface => {
-                Self::render_and_schedule(&mut target.render, target.surface.wl_surface(), qh)
+                Self::render_and_schedule(
+                    &mut target.render,
+                    target.surface.wl_surface(),
+                    qh,
+                    LockVisual::Hidden,
+                )?;
             }
             Mode::Lock(lock) => {
+                let visual = lock.state.visual(Instant::now());
                 let Some(target) = lock
                     .targets
                     .iter_mut()
@@ -424,42 +569,363 @@ impl App {
                 else {
                     return Ok(());
                 };
-                Self::render_and_schedule(&mut target.render, target.surface.wl_surface(), qh)
+                let outcome = Self::render_and_schedule(
+                    &mut target.render,
+                    target.surface.wl_surface(),
+                    qh,
+                    visual,
+                )?;
+                Self::record_green_present(target, visual, outcome);
             }
-            Mode::Layer(_) => Ok(()),
+            Mode::Layer(_) => {}
         }
+        Ok(())
     }
 
     fn render_and_schedule(
         render: &mut RenderState,
         surface: &wl_surface::WlSurface,
         qh: &QueueHandle<Self>,
-    ) -> Result<(), Box<dyn Error>> {
-        let continuous = render.module.wants_continuous_frames();
+        visual: LockVisual,
+    ) -> Result<RenderOutcome, Box<dyn Error>> {
+        let continuous = render.module.wants_continuous_frames()
+            || matches!(visual, LockVisual::AuthenticatedGreen { .. });
         if continuous && !render.frame_pending {
-            // A wl_surface frame callback is attached to the next commit, so
-            // request it before wgpu's successful present commits the surface.
             surface.frame(qh, FrameCallbackData(surface.clone()));
             render.frame_pending = true;
         }
-        let outcome = render.render()?;
+        let outcome = render.render(visual)?;
         if continuous && render.frame_pending && outcome == RenderOutcome::Skipped {
-            // Skipped acquisition paths have no wgpu present/Wayland commit.
-            // Commit the already-requested callback so the continuous chain
-            // cannot remain permanently pending after a resize, timeout, or
-            // surface recovery.
             surface.commit();
+        }
+        Ok(outcome)
+    }
+
+    fn record_green_present(target: &mut LockTarget, visual: LockVisual, outcome: RenderOutcome) {
+        if outcome == RenderOutcome::Presented
+            && let LockVisual::AuthenticatedGreen { attempt } = visual
+        {
+            target.green_presented = Some(attempt);
+        }
+    }
+
+    fn redraw_all_lock_targets(&mut self, qh: &QueueHandle<Self>) -> Result<(), Box<dyn Error>> {
+        let Mode::Lock(lock) = &mut self.mode else {
+            return Ok(());
+        };
+        let visual = lock.state.visual(Instant::now());
+        for target in &mut lock.targets {
+            let outcome = Self::render_and_schedule(
+                &mut target.render,
+                target.surface.wl_surface(),
+                qh,
+                visual,
+            )?;
+            Self::record_green_present(target, visual, outcome);
         }
         Ok(())
     }
 
-    fn exit_after_keypress(&mut self, connection: &Connection) {
-        if let Mode::Lock(lock) = &self.mode {
-            // Temporary GPU-context smoke test only: any key unlocks without password validation.
-            lock.session_lock.unlock();
-            let _ = connection.flush();
+    fn add_lock_output(
+        &mut self,
+        connection: &Connection,
+        qh: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) -> Result<(), Box<dyn Error>> {
+        let Mode::Lock(lock) = &self.mode else {
+            return Ok(());
+        };
+        if lock.targets.iter().any(|target| target.output == output) {
+            return Ok(());
         }
-        self.exit = true;
+        let session_lock = lock.session_lock.clone();
+        let surface = self.compositor_state.create_surface(qh);
+        let lock_surface = session_lock.create_lock_surface(surface, &output, qh);
+        let render = RenderState::new(
+            Renderer::new(connection, lock_surface.wl_surface())?,
+            self.module_selection,
+            true,
+        );
+        let Mode::Lock(lock) = &mut self.mode else {
+            return Ok(());
+        };
+        lock.targets.push(LockTarget {
+            render,
+            output,
+            surface: lock_surface,
+            green_presented: None,
+        });
+        lock.redraw_all = true;
+        Ok(())
+    }
+
+    fn handle_key_event(
+        &mut self,
+        keyboard: &wl_keyboard::WlKeyboard,
+        event: KeyEvent,
+        repeated: bool,
+    ) {
+        let can_edit = matches!(&self.mode, Mode::Lock(lock) if lock.state.can_edit());
+        if !can_edit {
+            return;
+        }
+        let Some(input) = self
+            .keyboards
+            .iter_mut()
+            .find(|input| &input.keyboard == keyboard)
+        else {
+            return;
+        };
+        if repeated && !input.repeat_allowed {
+            return;
+        }
+        if !repeated {
+            input.repeat_allowed = true;
+        }
+        let Mode::Lock(lock) = &mut self.mode else {
+            return;
+        };
+        let now = Instant::now();
+        match event.keysym {
+            Keysym::Return | Keysym::KP_Enter if !repeated => self.submit_password(),
+            Keysym::BackSpace => {
+                if lock.password.delete_last_scalar() {
+                    lock.state.note_edit(now);
+                    lock.redraw_all = true;
+                }
+            }
+            Keysym::Delete if !repeated => {
+                if lock.password.delete_last_scalar() {
+                    lock.state.note_edit(now);
+                    lock.redraw_all = true;
+                }
+            }
+            Keysym::Escape if !repeated => {
+                lock.password.clear();
+                lock.state.note_cancel(now);
+                lock.redraw_all = true;
+            }
+            _ => {
+                let Some(text) = event.utf8.as_deref() else {
+                    return;
+                };
+                if text.is_empty() || text.chars().any(char::is_control) {
+                    return;
+                }
+                match lock.password.append(text) {
+                    Ok(()) => {
+                        lock.state.note_edit(now);
+                        lock.redraw_all = true;
+                    }
+                    Err(SecretError::TooLong | SecretError::ContainsNul) => {}
+                    Err(_) => {
+                        lock.password.clear();
+                        lock.state.enter_fatal();
+                        self.fatal_disconnect = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn submit_password(&mut self) {
+        let Mode::Lock(lock) = &mut self.mode else {
+            return;
+        };
+        if !lock.state.can_edit() {
+            return;
+        }
+        let replacement = match LockedSecret::new() {
+            Ok(password) => password,
+            Err(error) => {
+                log::error!(target: "minecraft_plus_wayland::auth", "cannot allocate next password buffer: {error}");
+                lock.password.clear();
+                lock.state.enter_fatal();
+                self.fatal_disconnect = true;
+                return;
+            }
+        };
+        let password = std::mem::replace(&mut lock.password, replacement);
+        let Some(attempt) = lock.state.begin_authentication() else {
+            drop(password);
+            return;
+        };
+        // Existing SCTK repeat timers may outlive validation/backoff. Block them until a new
+        // physical press on that keyboard explicitly starts a fresh input generation.
+        for input in &mut self.keyboards {
+            input.repeat_allowed = false;
+        }
+        log::info!(target: "minecraft_plus_wayland::auth", "authentication started: attempt={attempt:?}");
+        if lock
+            .worker
+            .try_authenticate(AuthRequest { attempt, password })
+            .is_err()
+        {
+            log::error!(target: "minecraft_plus_wayland::auth", "authentication request channel failed: attempt={attempt:?}");
+            lock.state.enter_fatal();
+            self.fatal_disconnect = true;
+            return;
+        }
+        lock.redraw_all = true;
+    }
+
+    fn handle_auth_reply(&mut self, reply: AuthReply) {
+        let Mode::Lock(lock) = &mut self.mode else {
+            return;
+        };
+        if lock
+            .state
+            .authentication_result(reply.attempt, reply.decision, Instant::now())
+        {
+            log::info!(
+                target: "minecraft_plus_wayland::auth",
+                "authentication completed: attempt={:?}, category={:?}",
+                reply.attempt,
+                reply.decision,
+            );
+            lock.redraw_all = true;
+            if reply.decision == AuthDecision::SystemFailure {
+                self.fatal_disconnect = true;
+            }
+        }
+    }
+
+    fn handle_worker_closed(&mut self) {
+        let Mode::Lock(lock) = &mut self.mode else {
+            return;
+        };
+        if !lock.state.is_fatal() {
+            log::error!(target: "minecraft_plus_wayland::auth", "authentication worker channel disconnected");
+            lock.state.enter_fatal();
+            self.fatal_disconnect = true;
+        }
+    }
+
+    fn after_dispatch(&mut self, connection: &Connection, qh: &QueueHandle<Self>) {
+        let now = Instant::now();
+        if let Mode::Lock(lock) = &mut self.mode {
+            let before = lock.state.visual(now);
+            if lock.state.tick(now) {
+                lock.password.clear();
+            }
+            let after = lock.state.visual(now);
+            if before != after || after != lock.last_visual {
+                lock.redraw_all = true;
+                lock.last_visual = after;
+            }
+        }
+
+        let redraw = matches!(&self.mode, Mode::Lock(lock) if lock.redraw_all);
+        if redraw {
+            if let Err(error) = self.redraw_all_lock_targets(qh) {
+                self.lock_render_fault("redraw", &*error);
+                return;
+            }
+            if let Mode::Lock(lock) = &mut self.mode {
+                lock.redraw_all = false;
+            }
+        }
+
+        let ready = if let Mode::Lock(lock) = &self.mode {
+            match lock.state.visual(now) {
+                LockVisual::AuthenticatedGreen { attempt } => all_outputs_presented(
+                    lock.targets.iter().map(|target| target.green_presented),
+                    attempt,
+                ),
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if let Mode::Lock(lock) = &mut self.mode
+            && lock.state.prepare_unlock(now, ready)
+        {
+            self.request_session_unlock(connection, qh);
+        }
+        self.reschedule_deadline_timer();
+    }
+
+    fn reschedule_deadline_timer(&mut self) {
+        let deadline = match &self.mode {
+            Mode::Lock(lock) if lock.state.awaiting_unlock_sync() => {
+                Instant::now().checked_add(UNLOCK_FLUSH_RETRY)
+            }
+            Mode::Lock(lock) => lock.state.next_deadline(Instant::now()),
+            Mode::Layer(_) => None,
+        };
+        if deadline == self.scheduled_deadline {
+            return;
+        }
+        if let Some(token) = self.deadline_timer.take() {
+            self.loop_handle.remove(token);
+        }
+        self.scheduled_deadline = deadline;
+        let Some(deadline) = deadline else {
+            return;
+        };
+        match self.loop_handle.insert_source(
+            Timer::from_deadline(deadline),
+            |_deadline, &mut (), app| {
+                app.deadline_timer = None;
+                app.scheduled_deadline = None;
+                TimeoutAction::Drop
+            },
+        ) {
+            Ok(token) => self.deadline_timer = Some(token),
+            Err(error) => {
+                log::error!(target: "minecraft_plus_wayland::lock", "cannot schedule lock deadline: {error}");
+                if let Mode::Lock(lock) = &mut self.mode {
+                    lock.password.clear();
+                    lock.state.enter_fatal();
+                }
+                self.fatal_disconnect = true;
+            }
+        }
+    }
+
+    /// The only function in the repository permitted to call SessionLock::unlock().
+    fn request_session_unlock(&mut self, connection: &Connection, qh: &QueueHandle<Self>) {
+        let Mode::Lock(lock) = &mut self.mode else {
+            return;
+        };
+        if !lock.state.consume_unlock_gate() {
+            return;
+        }
+        log::info!(target: "minecraft_plus_wayland::lock", "authenticated unlock gate opened; sending unlock request");
+        lock.session_lock.unlock();
+        // The sync request is ordered after unlock_and_destroy. Keep its proxy alive through Done;
+        // WaylandSource keeps flushing and dispatching until the compositor processes the request.
+        lock.unlock_sync = Some(Box::new(connection.display().sync(qh, UnlockSyncData)));
+    }
+
+    fn unlock_sync_completed(&mut self) {
+        let Mode::Lock(lock) = &mut self.mode else {
+            return;
+        };
+        if lock.state.unlock_sync_completed() {
+            // Keep the callback proxy alive through Done; dropping it immediately after sync()
+            // drops its dispatch user data and can leave the application waiting forever.
+            lock.unlock_sync.take();
+            log::info!(target: "minecraft_plus_wayland::lock", "compositor processed unlock request; exiting");
+            self.exit = true;
+        }
+    }
+
+    fn clear_editable_secret(&mut self) {
+        if let Mode::Lock(lock) = &mut self.mode {
+            lock.password.clear();
+        }
+    }
+
+    fn lock_render_fault(&mut self, operation: &str, error: &dyn std::fmt::Display) {
+        log::error!(target: "minecraft_plus_wayland::lock", "lock rendering fault during {operation}: {error}");
+        if let Mode::Lock(lock) = &mut self.mode {
+            lock.password.clear();
+            lock.state.enter_fatal();
+        }
+        // Disconnect without a normal locked-object destructor; the compositor retains security
+        // and chooses its session-lock client failure fallback. Never convert a GPU fault to unlock.
+        self.fatal_disconnect = true;
     }
 }
 
@@ -484,7 +950,14 @@ impl LayerShellHandler for App {
 }
 
 impl SessionLockHandler for App {
-    fn locked(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _session_lock: SessionLock) {}
+    fn locked(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _session_lock: SessionLock) {
+        if let Mode::Lock(lock) = &mut self.mode
+            && lock.state.compositor_locked()
+        {
+            log::info!(target: "minecraft_plus_wayland::lock", "compositor confirmed session lock");
+            lock.redraw_all = true;
+        }
+    }
 
     fn finished(
         &mut self,
@@ -492,7 +965,17 @@ impl SessionLockHandler for App {
         _qh: &QueueHandle<Self>,
         _session_lock: SessionLock,
     ) {
-        self.exit = true;
+        let Mode::Lock(lock) = &mut self.mode else {
+            self.exit = true;
+            return;
+        };
+        lock.password.clear();
+        if lock.state.compositor_finished() {
+            self.fatal_disconnect = true;
+        } else {
+            self.exit_failure = Some("compositor refused or abandoned the session lock");
+            self.exit = true;
+        }
     }
 
     fn configure(
@@ -504,8 +987,7 @@ impl SessionLockHandler for App {
         _serial: u32,
     ) {
         if let Err(error) = self.configure_lock(&surface, configure, qh) {
-            log::error!("failed to configure session-lock surface: {error}");
-            self.exit = true;
+            self.lock_render_fault("configure", &*error);
         }
     }
 }
@@ -551,10 +1033,13 @@ impl CompositorHandler for App {
             }
             Mode::Layer(_) => return,
         }
-
         if let Err(error) = self.render_surface(surface, qh) {
-            log::error!("rendering stopped: {error}");
-            self.exit = true;
+            if matches!(self.mode, Mode::Lock(_)) {
+                self.lock_render_fault("frame", &*error);
+            } else {
+                log::error!("rendering stopped: {error}");
+                self.exit = true;
+            }
         }
     }
 
@@ -584,10 +1069,13 @@ impl OutputHandler for App {
 
     fn new_output(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
+        connection: &Connection,
+        qh: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
     ) {
+        if let Err(error) = self.add_lock_output(connection, qh, output) {
+            self.lock_render_fault("output hotplug", &*error);
+        }
     }
 
     fn update_output(
@@ -606,6 +1094,7 @@ impl OutputHandler for App {
     ) {
         if let Mode::Lock(lock) = &mut self.mode {
             lock.targets.retain(|target| target.output != output);
+            lock.redraw_all = true;
         }
     }
 }
@@ -624,8 +1113,33 @@ impl SeatHandler for App {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Keyboard && self.keyboard.is_none() {
-            self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
+        if capability != Capability::Keyboard
+            || !matches!(self.mode, Mode::Lock(_))
+            || self.keyboards.iter().any(|entry| entry.seat == seat)
+        {
+            return;
+        }
+        let keyboard = self.seat_state.get_keyboard_with_repeat(
+            qh,
+            &seat,
+            None,
+            self.loop_handle.clone(),
+            Box::new(|app, keyboard, event| app.handle_key_event(keyboard, event, true)),
+        );
+        match keyboard {
+            Ok(keyboard) => self.keyboards.push(SeatKeyboard {
+                seat,
+                keyboard,
+                repeat_allowed: true,
+            }),
+            Err(error) => {
+                log::error!(target: "minecraft_plus_wayland::lock", "failed to acquire seat keyboard: {error}");
+                if let Mode::Lock(lock) = &mut self.mode {
+                    lock.password.clear();
+                    lock.state.enter_fatal();
+                    self.fatal_disconnect = true;
+                }
+            }
         }
     }
 
@@ -633,17 +1147,20 @@ impl SeatHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _seat: wl_seat::WlSeat,
+        seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
         if capability == Capability::Keyboard
-            && let Some(keyboard) = self.keyboard.take()
+            && let Some(index) = self.keyboards.iter().position(|entry| entry.seat == seat)
         {
-            keyboard.release();
+            self.keyboards.remove(index).keyboard.release();
         }
     }
 
-    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {
+    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        if let Some(index) = self.keyboards.iter().position(|entry| entry.seat == seat) {
+            self.keyboards.remove(index).keyboard.release();
+        }
     }
 }
 
@@ -672,13 +1189,13 @@ impl KeyboardHandler for App {
 
     fn press_key(
         &mut self,
-        connection: &Connection,
+        _connection: &Connection,
         _qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         _serial: u32,
-        _event: KeyEvent,
+        event: KeyEvent,
     ) {
-        self.exit_after_keypress(connection);
+        self.handle_key_event(_keyboard, event, false);
     }
 
     fn repeat_key(
@@ -687,8 +1204,9 @@ impl KeyboardHandler for App {
         _qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         _serial: u32,
-        _event: KeyEvent,
+        event: KeyEvent,
     ) {
+        self.handle_key_event(_keyboard, event, true);
     }
 
     fn release_key(
@@ -714,6 +1232,23 @@ impl KeyboardHandler for App {
     }
 }
 
+struct UnlockSyncData;
+
+impl Dispatch<wl_callback::WlCallback, UnlockSyncData> for App {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _data: &UnlockSyncData,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.unlock_sync_completed();
+        }
+    }
+}
+
 delegate_registry!(App);
 
 impl ProvidesRegistryState for App {
@@ -725,3 +1260,39 @@ impl ProvidesRegistryState for App {
 }
 
 smithay_client_toolkit::delegate_dispatch2!(App);
+
+fn all_outputs_presented(
+    markers: impl IntoIterator<Item = Option<AttemptId>>,
+    attempt: AttemptId,
+) -> bool {
+    let mut markers = markers.into_iter();
+    let Some(first) = markers.next() else {
+        return false;
+    };
+    first == Some(attempt) && markers.all(|presented| presented == Some(attempt))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::all_outputs_presented;
+    use crate::lock::state::AttemptId;
+
+    #[test]
+    fn output_add_remove_bookkeeping_cannot_reuse_an_old_green_frame() {
+        let attempt = AttemptId::new(3);
+        let old_attempt = AttemptId::new(2);
+        let mut outputs = vec![Some(attempt), Some(attempt)];
+        assert!(all_outputs_presented(outputs.iter().copied(), attempt));
+        assert!(!all_outputs_presented([], attempt));
+
+        outputs.push(None);
+        assert!(!all_outputs_presented(outputs.iter().copied(), attempt));
+        outputs[2] = Some(old_attempt);
+        assert!(!all_outputs_presented(outputs.iter().copied(), attempt));
+        outputs[2] = Some(attempt);
+        assert!(all_outputs_presented(outputs.iter().copied(), attempt));
+
+        outputs.remove(1);
+        assert!(all_outputs_presented(outputs, attempt));
+    }
+}
