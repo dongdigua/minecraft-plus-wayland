@@ -1,9 +1,9 @@
 use std::{
-    env,
     error::Error,
     time::{Duration, Instant},
 };
 
+use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 use rand::Rng;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
@@ -168,7 +168,7 @@ impl LockSetup {
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
-    let startup = parse_startup_options()?;
+    let startup = parse_startup_options();
     // Validate the interval and establish the shared module timeline before requesting a session
     // lock. Returning an ordinary startup error after lock() would drop a requested lock object.
     let module_started_at = Instant::now();
@@ -334,82 +334,87 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn parse_startup_options() -> Result<StartupOptions, Box<dyn Error>> {
-    parse_options(env::args().skip(1))
+const CLI_AFTER_HELP: &str = "Modules:\n  0   load cube\n  1   dvd bounce trail\n  2   dvd bounce direct\n  3   item pop\n  4   alpha fluids water\n  5   alpha fluids lava\n  6   panorama\n  7   footprint\n  8   squid\n  9   item bounce\n  10  grass\n  11  blocks\n  12  creeper";
+
+fn cli_command() -> Command {
+    Command::new("minecraft-plus-wayland")
+        .about("Minecraft Plus dynamic wallpaper and session-lock")
+        .after_help(CLI_AFTER_HELP)
+        .arg(
+            Arg::new("lock")
+                .long("lock")
+                .help("Run as an ext-session-lock-v1 client")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("module")
+                .short('m')
+                .long("module")
+                .value_name("MODULE")
+                .help("Render one fixed Web module; conflicts with --interval")
+                .value_parser(value_parser!(u8).range(0..=12))
+                .conflicts_with("interval"),
+        )
+        .arg(
+            Arg::new("interval")
+                .short('t')
+                .long("interval")
+                .value_name("SECONDS")
+                .help("Switch modules every whole number of seconds; 0 disables switching")
+                .value_parser(value_parser!(u64)),
+        )
 }
 
+fn parse_startup_options() -> StartupOptions {
+    startup_options_from_matches(cli_command().get_matches())
+}
+
+#[cfg(test)]
 fn parse_options(
     arguments: impl IntoIterator<Item = String>,
-) -> Result<StartupOptions, Box<dyn Error>> {
-    let mut mode = StartupMode::LayerShell;
-    let mut module = None;
-    let mut interval_seconds = None;
-    let mut interval_supplied = false;
-    let mut arguments = arguments.into_iter();
+) -> Result<StartupOptions, clap::Error> {
+    cli_command()
+        .try_get_matches_from(
+            std::iter::once(String::from("minecraft-plus-wayland")).chain(arguments),
+        )
+        .map(startup_options_from_matches)
+}
 
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--lock" => mode = StartupMode::SessionLock,
-            "--module" | "-m" => {
-                let module_id = arguments
-                    .next()
-                    .ok_or("--module/-m requires a module number")?
-                    .parse::<u8>()
-                    .map_err(|_| "--module/-m requires an integer module number")?;
-                module = Some(ModuleSelection::from_id(module_id).ok_or_else(|| {
-                    format!("module={module_id} is outside the valid range 0..=12")
-                })?);
-            }
-            "--interval" | "-t" => {
-                interval_supplied = true;
-                interval_seconds = Some(
-                    arguments
-                        .next()
-                        .ok_or("--interval/-t requires a number of seconds")?
-                        .parse::<u64>()
-                        .map_err(
-                            |_| "--interval/-t requires a non-negative integer number of seconds",
-                        )?,
-                );
-            }
-            "--help" | "-h" => {
-                return Err(
-                    "Usage: minecraft-plus-wayland [--lock] [--module|-m <n> | --interval|-t <seconds>]\n\nWithout --module, one of the 13 Web modules is selected randomly at startup. --interval/-t switches to a different random module every whole <seconds>; 0 or omitting the option disables switching. --interval/-t conflicts with --module/-m. --module 0 selects Web module=0 (load cube); --module 1 selects module=1 (dvd bounce trail); --module 2 selects module=2 (dvd bounce direct); --module 3 selects module=3 (item pop); --module 4 selects module=4 (alpha fluids water); --module 5 selects module=5 (alpha fluids lava); --module 6 selects module=6 (panorama); --module 7 selects module=7 (footprint); --module 8 selects module=8 (squid); --module 9 selects module=9 (item bounce); --module 10 selects module=10 (grass); --module 11 selects module=11 (blocks); --module 12 selects module=12 (creeper)."
-                        .into(),
-                );
-            }
-            _ => {
-                return Err(format!(
-                    "unknown argument {argument:?}; usage: minecraft-plus-wayland [--lock] [--module|-m <n> | --interval|-t <seconds>]"
-                )
-                .into());
-            }
-        }
-    }
-
-    if module.is_some() && interval_supplied {
-        return Err("--module/-m conflicts with --interval/-t".into());
-    }
-
-    let module = module.unwrap_or_else(|| {
-        let module_id = rand::thread_rng().gen_range(0, 13);
-        let selection = ModuleSelection::from_id(module_id)
-            .expect("random module id must remain inside the 13-entry module table");
-        log::info!(
-            target: "minecraft_plus_wayland::startup",
-            "no --module argument supplied; randomly selected module={}",
-            selection.id(),
-        );
-        selection
-    });
-    let module_switch_interval = interval_seconds
+fn startup_options_from_matches(matches: ArgMatches) -> StartupOptions {
+    let mode = if matches.get_flag("lock") {
+        StartupMode::SessionLock
+    } else {
+        StartupMode::LayerShell
+    };
+    let module = matches
+        .get_one::<u8>("module")
+        .copied()
+        .map(|module_id| {
+            ModuleSelection::from_id(module_id)
+                .expect("clap restricts module IDs to the 13-entry module table")
+        })
+        .unwrap_or_else(|| {
+            let module_id = rand::thread_rng().gen_range(0, 13);
+            let selection = ModuleSelection::from_id(module_id)
+                .expect("random module id must remain inside the 13-entry module table");
+            log::info!(
+                target: "minecraft_plus_wayland::startup",
+                "no --module argument supplied; randomly selected module={}",
+                selection.id(),
+            );
+            selection
+        });
+    let module_switch_interval = matches
+        .get_one::<u64>("interval")
+        .copied()
         .filter(|seconds| *seconds != 0)
         .map(Duration::from_secs);
-    Ok(StartupOptions {
+
+    StartupOptions {
         mode,
         module,
         module_switch_interval,
-    })
+    }
 }
 
 fn initial_module_deadline(
@@ -1554,13 +1559,15 @@ fn all_outputs_presented(
 mod tests {
     use std::time::{Duration, Instant};
 
+    use clap::error::ErrorKind;
+
     use super::{
         StartupMode, advance_periodic_deadline, all_outputs_presented, continuous_frame_required,
         earliest_deadline, initial_module_deadline, module_id_excluding, parse_options,
     };
     use crate::lock::state::{AttemptId, LockVisual};
 
-    fn options(arguments: &[&str]) -> Result<super::StartupOptions, Box<dyn std::error::Error>> {
+    fn options(arguments: &[&str]) -> Result<super::StartupOptions, clap::Error> {
         parse_options(arguments.iter().map(|argument| (*argument).to_owned()))
     }
 
@@ -1602,8 +1609,8 @@ mod tests {
             &["-m", "3", "-t", "0"][..],
         ] {
             assert_eq!(
-                options(arguments).unwrap_err().to_string(),
-                "--module/-m conflicts with --interval/-t"
+                options(arguments).unwrap_err().kind(),
+                ErrorKind::ArgumentConflict
             );
         }
     }
@@ -1617,6 +1624,21 @@ mod tests {
         ] {
             assert!(options(arguments).is_err());
         }
+    }
+
+    #[test]
+    fn clap_generates_help_and_validates_module_range() {
+        let help = options(&["--help"]).unwrap_err();
+        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
+        assert!(help.to_string().contains("--module <MODULE>"));
+        assert!(help.to_string().contains("selected randomly at startup"));
+        assert!(help.to_string().contains("conflicts with --module"));
+        assert!(help.to_string().contains("12  creeper"));
+
+        assert_eq!(
+            options(&["--module", "13"]).unwrap_err().kind(),
+            ErrorKind::ValueValidation
+        );
     }
 
     #[test]
