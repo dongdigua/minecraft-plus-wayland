@@ -40,6 +40,7 @@ use smithay_client_toolkit::{
         },
     },
 };
+use zeroize::Zeroizing;
 
 use crate::{
     lock::{
@@ -62,6 +63,7 @@ const FALLBACK_SIZE: RenderSize = RenderSize {
     height: 720,
 };
 const UNLOCK_FLUSH_RETRY: Duration = Duration::from_millis(16);
+const RENDER_RETRY: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Copy, Debug)]
 enum StartupMode {
@@ -478,6 +480,27 @@ struct RenderReport {
     frame_time: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceRole {
+    Layer,
+    SessionLock,
+}
+
+fn session_lock_render_retry_deadline(
+    configured: bool,
+    outcome: RenderOutcome,
+    frame_time: Instant,
+) -> Result<Option<Instant>, &'static str> {
+    if configured && outcome == RenderOutcome::Skipped {
+        frame_time
+            .checked_add(RENDER_RETRY)
+            .map(Some)
+            .ok_or("cannot schedule session-lock render retry")
+    } else {
+        Ok(None)
+    }
+}
+
 struct RenderState {
     renderer: Renderer,
     module: Box<dyn Module>,
@@ -485,6 +508,7 @@ struct RenderState {
     configured_size: Option<RenderSize>,
     module_initialized: bool,
     frame_pending: bool,
+    render_retry_deadline: Option<Instant>,
     started_at: Instant,
     last_frame_at: Instant,
 }
@@ -503,6 +527,7 @@ impl RenderState {
             configured_size: None,
             module_initialized: false,
             frame_pending: false,
+            render_retry_deadline: None,
             started_at: module_started_at,
             last_frame_at: module_started_at,
         }
@@ -651,6 +676,7 @@ impl App {
             target.surface.wl_surface(),
             qh,
             LockVisual::Hidden,
+            SurfaceRole::Layer,
         )?;
         Ok(())
     }
@@ -676,8 +702,13 @@ impl App {
             return Ok(());
         };
         target.render.configure(configure.new_size)?;
-        let report =
-            Self::render_and_schedule(&mut target.render, target.surface.wl_surface(), qh, visual)?;
+        let report = Self::render_and_schedule(
+            &mut target.render,
+            target.surface.wl_surface(),
+            qh,
+            visual,
+            SurfaceRole::SessionLock,
+        )?;
         Self::record_dissolve_complete_present(target, visual, report);
         Ok(())
     }
@@ -694,6 +725,7 @@ impl App {
                     target.surface.wl_surface(),
                     qh,
                     LockVisual::Hidden,
+                    SurfaceRole::Layer,
                 )?;
             }
             Mode::Lock(lock) => {
@@ -713,6 +745,7 @@ impl App {
                     target.surface.wl_surface(),
                     qh,
                     visual,
+                    SurfaceRole::SessionLock,
                 )?;
                 Self::record_dissolve_complete_present(target, visual, report);
             }
@@ -726,6 +759,7 @@ impl App {
         surface: &wl_surface::WlSurface,
         qh: &QueueHandle<Self>,
         visual: LockVisual,
+        surface_role: SurfaceRole,
     ) -> Result<RenderReport, Box<dyn Error>> {
         // This one timestamp drives the shader uniforms, frame-chain decision and completed-frame
         // marker. Sampling time again after encoding could mark an incomplete dissolve as complete.
@@ -744,15 +778,22 @@ impl App {
             render.frame_pending = true;
         }
         let outcome = render.render(visual, frame_time)?;
-        // A converged opaque overlay normally has no frame chain. If a one-shot state redraw is
-        // skipped because the surface is temporarily unavailable, attach a callback to an empty
-        // commit so the new mask/visual is retried instead of being lost permanently.
-        if outcome == RenderOutcome::Skipped {
-            if !render.frame_pending {
-                surface.frame(qh, FrameCallbackData(surface.clone()));
-                render.frame_pending = true;
+        match surface_role {
+            SurfaceRole::SessionLock => {
+                render.render_retry_deadline = session_lock_render_retry_deadline(
+                    render.configured_size.is_some(),
+                    outcome,
+                    frame_time,
+                )?;
             }
-            surface.commit();
+            SurfaceRole::Layer if outcome == RenderOutcome::Skipped => {
+                if !render.frame_pending {
+                    surface.frame(qh, FrameCallbackData(surface.clone()));
+                    render.frame_pending = true;
+                }
+                surface.commit();
+            }
+            SurfaceRole::Layer => {}
         }
         Ok(RenderReport {
             outcome,
@@ -786,6 +827,39 @@ impl App {
                 target.surface.wl_surface(),
                 qh,
                 visual,
+                SurfaceRole::SessionLock,
+            )?;
+            Self::record_dissolve_complete_present(target, visual, report);
+        }
+        Ok(())
+    }
+
+    fn retry_due_lock_targets(
+        &mut self,
+        now: Instant,
+        qh: &QueueHandle<Self>,
+    ) -> Result<(), Box<dyn Error>> {
+        let Mode::Lock(lock) = &mut self.mode else {
+            return Ok(());
+        };
+        if !lock.state.can_use_lock_surfaces() {
+            return Ok(());
+        }
+        let visual = lock.state.visual(now);
+        for target in &mut lock.targets {
+            if !target
+                .render
+                .render_retry_deadline
+                .is_some_and(|deadline| deadline <= now)
+            {
+                continue;
+            }
+            let report = Self::render_and_schedule(
+                &mut target.render,
+                target.surface.wl_surface(),
+                qh,
+                visual,
+                SurfaceRole::SessionLock,
             )?;
             Self::record_dissolve_complete_present(target, visual, report);
         }
@@ -834,9 +908,10 @@ impl App {
     fn handle_key_event(
         &mut self,
         keyboard: &wl_keyboard::WlKeyboard,
-        event: KeyEvent,
+        mut event: KeyEvent,
         repeated: bool,
     ) {
+        let utf8 = event.utf8.take().map(Zeroizing::new);
         let can_edit = matches!(&self.mode, Mode::Lock(lock) if lock.state.can_edit());
         if !can_edit {
             return;
@@ -878,7 +953,7 @@ impl App {
                 lock.redraw_all = true;
             }
             _ => {
-                let Some(text) = event.utf8.as_deref() else {
+                let Some(text) = utf8.as_ref().map(|text| text.as_str()) else {
                     return;
                 };
                 if text.is_empty() || text.chars().any(char::is_control) {
@@ -1010,6 +1085,7 @@ impl App {
                 target.surface.wl_surface(),
                 qh,
                 LockVisual::Hidden,
+                SurfaceRole::Layer,
             )?;
         }
         Ok(())
@@ -1074,6 +1150,11 @@ impl App {
             }
         }
 
+        if let Err(error) = self.retry_due_lock_targets(now, qh) {
+            self.lock_render_fault("surface retry", &*error);
+            return;
+        }
+
         let ready = if let Mode::Lock(lock) = &self.mode {
             let visual = lock.state.visual(now);
             visual
@@ -1111,7 +1192,18 @@ impl App {
             Mode::Lock(lock) if lock.state.can_use_lock_surfaces() => self.next_module_switch,
             Mode::Lock(_) => None,
         };
-        let deadline = earliest_deadline(lock_deadline, module_deadline);
+        let render_deadline = match &self.mode {
+            Mode::Lock(lock) if lock.state.can_use_lock_surfaces() => lock
+                .targets
+                .iter()
+                .filter_map(|target| target.render.render_retry_deadline)
+                .min(),
+            Mode::Layer(_) | Mode::Lock(_) => None,
+        };
+        let deadline = earliest_deadline(
+            earliest_deadline(lock_deadline, module_deadline),
+            render_deadline,
+        );
         if deadline == self.scheduled_deadline {
             return;
         }
@@ -1564,8 +1656,12 @@ mod tests {
     use super::{
         StartupMode, advance_periodic_deadline, all_outputs_presented, continuous_frame_required,
         earliest_deadline, initial_module_deadline, module_id_excluding, parse_options,
+        session_lock_render_retry_deadline,
     };
-    use crate::lock::state::{AttemptId, LockVisual};
+    use crate::{
+        lock::state::{AttemptId, LockVisual},
+        renderer::RenderOutcome,
+    };
 
     fn options(arguments: &[&str]) -> Result<super::StartupOptions, clap::Error> {
         parse_options(arguments.iter().map(|argument| (*argument).to_owned()))
@@ -1631,8 +1727,7 @@ mod tests {
         let help = options(&["--help"]).unwrap_err();
         assert_eq!(help.kind(), ErrorKind::DisplayHelp);
         assert!(help.to_string().contains("--module <MODULE>"));
-        assert!(help.to_string().contains("selected randomly at startup"));
-        assert!(help.to_string().contains("conflicts with --module"));
+        assert!(help.to_string().contains("conflicts with --interval"));
         assert!(help.to_string().contains("12  creeper"));
 
         assert_eq!(
@@ -1691,6 +1786,23 @@ mod tests {
         assert_eq!(earliest_deadline(Some(lock), Some(module)), Some(lock));
         assert_eq!(earliest_deadline(None, Some(module)), Some(module));
         assert_eq!(earliest_deadline(None, None), None);
+    }
+
+    #[test]
+    fn session_lock_skips_wait_for_configure_or_schedule_a_retry_without_committing() {
+        let now = Instant::now();
+        assert_eq!(
+            session_lock_render_retry_deadline(false, RenderOutcome::Skipped, now),
+            Ok(None)
+        );
+        assert_eq!(
+            session_lock_render_retry_deadline(true, RenderOutcome::Presented, now),
+            Ok(None)
+        );
+        assert_eq!(
+            session_lock_render_retry_deadline(true, RenderOutcome::Skipped, now),
+            Ok(now.checked_add(super::RENDER_RETRY))
+        );
     }
 
     #[test]

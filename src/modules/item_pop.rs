@@ -724,7 +724,11 @@ fn fs_unorm(input: VertexOutput) -> @location(0) vec4<f32> {
     if (color.a < 0.1) {
         discard;
     }
-    return vec4<f32>(color.rgb * input.light, color.a);
+    // The Web frame tail clears only the drawing-buffer alpha to 1 after all
+    // item draws. No later module-3 pass observes the intermediate alpha, so
+    // writing 1 here is final-frame equivalent and also keeps premultiplied
+    // Wayland presentation opaque without an extra pass.
+    return vec4<f32>(color.rgb * input.light, 1.0);
 }
 "#;
 
