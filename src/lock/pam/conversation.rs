@@ -1,5 +1,5 @@
 // Derived in part from sudo-rs 0.2.14 src/pam/converse.rs under the MIT license.
-// See THIRD_PARTY_NOTICES.md and licenses/sudo-rs-LICENSE-MIT.
+// See THIRD_PARTY_NOTICES.md and sudo-rs-LICENSE-MIT.
 
 use std::{
     ffi::{c_int, c_void},
@@ -7,7 +7,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
-use crate::lock::secret::LockedSecret;
+use super::secret::LockedSecret;
 
 use super::{
     ffi::{
@@ -171,7 +171,7 @@ pub(super) unsafe extern "C" fn converse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lock::auth::pam::{
+    use crate::lock::pam::{
         ffi::PamResponse,
         response::{fail_allocation_after, wipe_and_free_pam_responses},
     };

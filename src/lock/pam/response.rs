@@ -1,11 +1,11 @@
 // Derived in part from sudo-rs 0.2.14 src/pam/converse.rs and securemem.rs under
-// the MIT license. See THIRD_PARTY_NOTICES.md and licenses/sudo-rs-LICENSE-MIT.
+// the MIT license. See THIRD_PARTY_NOTICES.md and sudo-rs-LICENSE-MIT.
 
 use std::ptr::NonNull;
 
 use zeroize::Zeroize;
 
-use crate::lock::secret::LockedSecret;
+use super::secret::LockedSecret;
 
 use super::ffi::{PAM_MAX_RESP_SIZE, PamResponse};
 

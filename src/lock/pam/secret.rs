@@ -1,5 +1,5 @@
 // Derived in part from sudo-rs 0.2.14 src/pam/securemem.rs under the MIT license.
-// See THIRD_PARTY_NOTICES.md and licenses/sudo-rs-LICENSE-MIT.
+// See THIRD_PARTY_NOTICES.md and sudo-rs-LICENSE-MIT.
 
 use std::{fmt, io, ptr::NonNull, str};
 

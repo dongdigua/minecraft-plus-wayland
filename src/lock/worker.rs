@@ -9,8 +9,7 @@ use std::{
 use smithay_client_toolkit::reexports::calloop::channel;
 
 use super::{
-    auth::pam::{PamAuthenticator, PamOutcome},
-    secret::LockedSecret,
+    pam::{LockedSecret, PamAuthenticator, PamOutcome},
     state::{AttemptId, AuthDecision},
 };
 

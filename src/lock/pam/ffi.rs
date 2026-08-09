@@ -1,7 +1,7 @@
 // Derived from sudo-rs 0.2.14 src/pam/sys_linuxpam.rs under the MIT license.
 // The source bindings were generated from Linux-PAM headers. This file intentionally keeps only
 // the ABI required by the lock-screen authentication transaction.
-// See THIRD_PARTY_NOTICES.md and licenses/sudo-rs-LICENSE-MIT.
+// See THIRD_PARTY_NOTICES.md and sudo-rs-LICENSE-MIT.
 
 use std::ffi::{c_char, c_int, c_void};
 

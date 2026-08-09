@@ -44,9 +44,8 @@ use smithay_client_toolkit::{
 use crate::{
     lock::{
         animations::LockAnimation,
-        auth::pam::PamAuthenticator,
         identity::TrustedIdentity,
-        secret::{LockedSecret, SecretError, disable_process_dumps},
+        pam::{LockedSecret, PamAuthenticator, SecretError, disable_process_dumps},
         state::{AttemptId, AuthDecision, LockState, LockVisual},
         worker::{AuthReply, AuthRequest, AuthWorker},
     },

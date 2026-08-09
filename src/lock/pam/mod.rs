@@ -1,5 +1,5 @@
 // Derived in part from sudo-rs 0.2.14 src/pam under the MIT license.
-// See THIRD_PARTY_NOTICES.md and licenses/sudo-rs-LICENSE-MIT.
+// See THIRD_PARTY_NOTICES.md and sudo-rs-LICENSE-MIT.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -7,6 +7,7 @@ mod conversation;
 mod error;
 mod ffi;
 mod response;
+mod secret;
 
 use std::{
     ffi::{CStr, c_void},
@@ -16,12 +17,11 @@ use std::{
     rc::Rc,
 };
 
-use crate::lock::secret::{LockedSecret, ProcessDumpProtection};
-
 use conversation::{CallbackFailure, ConversationData};
 pub use error::{PamDenial, PamError, PamErrorKind, PamErrorStage};
 use error::{classify_account, classify_authenticate};
 use ffi::{PAM_SUCCESS, PAM_USER, PamApi, PamConv, PamHandle, SystemPam};
+pub use secret::{LockedSecret, ProcessDumpProtection, SecretError, disable_process_dumps};
 
 const LOGIN_SERVICE: &CStr = c"login";
 
@@ -285,7 +285,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::lock::auth::pam::{
+    use crate::lock::pam::{
         ffi::{
             PAM_ACCT_EXPIRED, PAM_AUTH_ERR, PAM_CONV_ERR, PAM_PROMPT_ECHO_OFF, PamMessage,
             PamResponse,
