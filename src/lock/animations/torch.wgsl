@@ -4,7 +4,7 @@ struct Uniforms {
   camera_pos: vec3f,
   resolution: vec2f,
   sample_index: u32,
-  _padding: u32,
+  component: u32,
 };
 
 struct PresentUniforms {
@@ -46,13 +46,6 @@ struct Box {
 struct VSOutput {
   @builtin(position) position: vec4f,
   @location(0) coord: vec2f,
-};
-
-struct CacheOutput {
-  @location(0) redstone: vec4f,
-  @location(1) copper: vec4f,
-  @location(2) soul: vec4f,
-  @location(3) torch: vec4f,
 };
 
 struct ComponentSample {
@@ -335,7 +328,7 @@ fn renderComponent(
 }
 
 @fragment
-fn fs_accumulate(fsIn: VSOutput) -> CacheOutput {
+fn fs_accumulate(fsIn: VSOutput) -> @location(0) vec4f {
   let aspect = uniforms.resolution.x / uniforms.resolution.y;
   let d = 1.0 / tan(uniforms.fov / 2.0);
   let v = normalize(vec3f(fsIn.coord.x * aspect, fsIn.coord.y, d));
@@ -344,13 +337,17 @@ fn fs_accumulate(fsIn: VSOutput) -> CacheOutput {
   let cameraRay = Ray(uniforms.camera_pos, rd);
   let pixel = u32(fsIn.position.y) * u32(uniforms.resolution.x) + u32(fsIn.position.x);
 
-  // Redstone uses its lit cross-sheet bank. The other three components use the MC-style
-  // redstone-off bank; their alpha channels carry the shared all-off sky RGB.
-  return CacheOutput(
-    renderComponent(cameraRay, pixel, 0u, REDSTONE_ON_BANK, 3u),
-    renderComponent(cameraRay, pixel, 1u, REDSTONE_OFF_BANK, 0u),
-    renderComponent(cameraRay, pixel, 2u, REDSTONE_OFF_BANK, 1u),
-    renderComponent(cameraRay, pixel, 3u, REDSTONE_OFF_BANK, 2u),
+  // Exactly one component is updated per display frame. Redstone uses its lit cross-sheet bank;
+  // the other three use the MC-style redstone-off bank and carry the shared ambient RGB in alpha.
+  if uniforms.component == 0u {
+    return renderComponent(cameraRay, pixel, 0u, REDSTONE_ON_BANK, 3u);
+  }
+  return renderComponent(
+    cameraRay,
+    pixel,
+    uniforms.component,
+    REDSTONE_OFF_BANK,
+    uniforms.component - 1u,
   );
 }
 

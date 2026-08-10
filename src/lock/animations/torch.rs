@@ -6,6 +6,7 @@ const SHADER: &str = include_str!("torch.wgsl");
 const ACCUMULATION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const CACHE_LAYERS: u32 = 4;
 const MAX_CACHE_UPDATES: u32 = 512;
+const TOTAL_CACHE_UPDATES: u32 = MAX_CACHE_UPDATES * CACHE_LAYERS;
 const UNIFORM_BYTES: u64 = 80;
 const PRESENT_UNIFORM_BYTES: u64 = 16;
 const BOX_STRIDE: usize = 80;
@@ -74,7 +75,7 @@ impl TorchAnimation {
     }
 
     pub fn wants_continuous_frames(&self) -> bool {
-        self.temporal.needs_update()
+        self.temporal.needs_follow_up_after_next_update()
     }
 
     pub fn draw(
@@ -105,34 +106,28 @@ impl TorchAnimation {
                     .as_ref()
                     .expect("torch trace uniform buffer initialized"),
                 0,
-                &encoded_trace_uniforms(size, update.sample_index),
+                &encoded_trace_uniforms(size, update.sample_index, update.component_index),
             );
             let accumulation = self
                 .accumulation
                 .as_ref()
                 .expect("torch accumulation target initialized");
-            let color_attachments = accumulation
-                .layer_views
-                .iter()
-                .map(|view| {
-                    Some(wgpu::RenderPassColorAttachment {
-                        view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: if update.sample_index == 0 {
-                                wgpu::LoadOp::Clear(wgpu::Color::BLACK)
-                            } else {
-                                wgpu::LoadOp::Load
-                            },
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })
-                })
-                .collect::<Vec<_>>();
+            let component_view = &accumulation.layer_views[update.component_index as usize];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("torch four-component HDR accumulation"),
-                color_attachments: &color_attachments,
+                label: Some("torch round-robin component HDR accumulation"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: component_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: if update.sample_index == 0 {
+                            wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
@@ -360,19 +355,16 @@ impl TorchAnimation {
                 operation: wgpu::BlendOperation::Add,
             },
         });
-        let trace_targets: [Option<wgpu::ColorTargetState>; CACHE_LAYERS as usize] =
-            std::array::from_fn(|_| {
-                Some(wgpu::ColorTargetState {
-                    format: ACCUMULATION_FORMAT,
-                    blend,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })
-            });
+        let trace_targets = [Some(wgpu::ColorTargetState {
+            format: ACCUMULATION_FORMAT,
+            blend,
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
         let trace_pipeline =
             context
                 .device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("torch four-component HDR trace pipeline"),
+                    label: Some("torch round-robin component HDR trace pipeline"),
                     layout: Some(&trace_pipeline_layout),
                     vertex: wgpu::VertexState {
                         module: &shader,
@@ -526,6 +518,7 @@ impl Default for TorchAnimation {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TemporalUpdate {
+    component_index: u32,
     sample_index: u32,
     new_sample_weight: f32,
 }
@@ -551,17 +544,22 @@ impl TemporalAccumulator {
         self.updates = 0;
     }
 
-    fn needs_update(&self) -> bool {
-        self.size.is_some() && self.updates < MAX_CACHE_UPDATES
+    // Frame scheduling is decided immediately before the current draw consumes one update.
+    // Do not queue a redundant callback when that draw will complete the fourth cache.
+    fn needs_follow_up_after_next_update(&self) -> bool {
+        self.size.is_some() && self.updates.saturating_add(1) < TOTAL_CACHE_UPDATES
     }
 
     fn next_update(&mut self) -> Option<TemporalUpdate> {
-        if self.updates >= MAX_CACHE_UPDATES {
+        if self.updates >= TOTAL_CACHE_UPDATES {
             return None;
         }
+        let component_index = self.updates % CACHE_LAYERS;
+        let sample_index = self.updates / CACHE_LAYERS;
         let update = TemporalUpdate {
-            sample_index: self.updates,
-            new_sample_weight: 1.0 / (self.updates + 1) as f32,
+            component_index,
+            sample_index,
+            new_sample_weight: 1.0 / (sample_index + 1) as f32,
         };
         self.updates += 1;
         Some(update)
@@ -624,7 +622,11 @@ fn encoded_boxes() -> Vec<u8> {
     bytes
 }
 
-fn encoded_trace_uniforms(size: RenderSize, sample_index: u32) -> [u8; UNIFORM_BYTES as usize] {
+fn encoded_trace_uniforms(
+    size: RenderSize,
+    sample_index: u32,
+    component_index: u32,
+) -> [u8; UNIFORM_BYTES as usize] {
     let mut bytes = [0; UNIFORM_BYTES as usize];
     write_vec3(&mut bytes, 0, [1.0, 0.0, 0.0]);
     write_vec3(&mut bytes, 16, [0.0, 0.0, 1.0]);
@@ -633,6 +635,7 @@ fn encoded_trace_uniforms(size: RenderSize, sample_index: u32) -> [u8; UNIFORM_B
     write_f32(&mut bytes, 64, size.width as f32);
     write_f32(&mut bytes, 68, size.height as f32);
     write_u32(&mut bytes, 72, sample_index);
+    write_u32(&mut bytes, 76, component_index);
     bytes
 }
 
@@ -860,19 +863,34 @@ mod tests {
     }
 
     #[test]
-    fn contribution_cache_accumulates_globally_until_resize() {
+    fn contribution_caches_update_round_robin_until_resize() {
         let mut temporal = TemporalAccumulator::default();
         let size = RenderSize {
             width: 10,
             height: 8,
         };
         assert!(temporal.resize(size));
-        assert_eq!(temporal.next_update().unwrap().sample_index, 0);
-        assert_eq!(temporal.next_update().unwrap().sample_index, 1);
+        for expected_component in 0..CACHE_LAYERS {
+            assert_eq!(
+                temporal.next_update().unwrap(),
+                TemporalUpdate {
+                    component_index: expected_component,
+                    sample_index: 0,
+                    new_sample_weight: 1.0,
+                }
+            );
+        }
 
         // Mask/state changes are deliberately absent from the cache accumulator.
         assert!(!temporal.resize(size));
-        assert_eq!(temporal.next_update().unwrap().sample_index, 2);
+        assert_eq!(
+            temporal.next_update().unwrap(),
+            TemporalUpdate {
+                component_index: 0,
+                sample_index: 1,
+                new_sample_weight: 0.5,
+            }
+        );
     }
 
     #[test]
@@ -895,18 +913,39 @@ mod tests {
     }
 
     #[test]
-    fn continuous_frames_stop_after_512_cache_updates() {
+    fn continuous_frames_stop_after_512_updates_per_cache() {
         let mut temporal = TemporalAccumulator::default();
         temporal.resize(RenderSize {
             width: 1,
             height: 1,
         });
-        for expected in 0..MAX_CACHE_UPDATES {
-            assert!(temporal.needs_update());
-            assert_eq!(temporal.next_update().unwrap().sample_index, expected);
+        for total in 0..TOTAL_CACHE_UPDATES {
+            assert!(temporal.updates < TOTAL_CACHE_UPDATES);
+            assert_eq!(
+                temporal.needs_follow_up_after_next_update(),
+                total + 1 < TOTAL_CACHE_UPDATES,
+            );
+            let update = temporal.next_update().unwrap();
+            assert_eq!(update.component_index, total % CACHE_LAYERS);
+            assert_eq!(update.sample_index, total / CACHE_LAYERS);
         }
-        assert!(!temporal.needs_update());
+        assert_eq!(temporal.updates, TOTAL_CACHE_UPDATES);
+        assert!(!temporal.needs_follow_up_after_next_update());
         assert_eq!(temporal.next_update(), None);
+    }
+
+    #[test]
+    fn trace_uniform_encodes_the_selected_component() {
+        let bytes = encoded_trace_uniforms(
+            RenderSize {
+                width: 10,
+                height: 8,
+            },
+            27,
+            3,
+        );
+        assert_eq!(u32::from_ne_bytes(bytes[72..76].try_into().unwrap()), 27);
+        assert_eq!(u32::from_ne_bytes(bytes[76..80].try_into().unwrap()), 3);
     }
 
     #[test]
