@@ -64,6 +64,9 @@ const NUM_BOXES = 18;
 
 const PI = acos(-1.0);
 const INF = 1e10;
+const HIT_EPS = 1e-4;
+const SHEET_EDGE_EPS = 1e-5;
+const PARALLEL_EPS = 1e-8;
 const NUM_RAYS_PER_COMPONENT = 4u;
 const NO_LIGHT_OWNER = 4u;
 const REDSTONE_ON_BANK = 0u;
@@ -94,35 +97,54 @@ fn boxEnabledInBank(flags: u32, bank: u32) -> bool {
 }
 
 fn hitAABB(ray: Ray, aabb: mat2x3f) -> Hit {
-  let invD = 1.0 / ray.rd;
-  let t0 = (aabb[0] - ray.ro) * invD;
-  let t1 = (aabb[1] - ray.ro) * invD;
-
-  let tmin = min(t0, t1);
-  let tmax = max(t0, t1);
-
-  let tNear = max(max(tmin.x, tmin.y), tmin.z);
-  let tFar = min(min(tmax.x, tmax.y), tmax.z);
-
-  if (tFar + 1e-5 < max(tNear, 0.0)) {
+  // Parallel slabs need an explicit interval: multiplying a zero distance by an infinite
+  // reciprocal produces NaN on some GPUs, especially for zero-thickness boxes.
+  let parallel = abs(ray.rd) < vec3f(PARALLEL_EPS);
+  let outsideParallelSlab = parallel & ((ray.ro < aabb[0]) | (ray.ro > aabb[1]));
+  if any(outsideParallelSlab) {
     return Hit(INF, vec3f(0.0), vec3f(0.0), vec4f(0.0), Material(0.0, 0.0));
   }
 
-  let eps = 1e-4;
+  // Keep the slab calculation vectorized. Parallel axes are unconstrained after the bounds check.
+  let safeDirection = select(ray.rd, vec3f(1.0), parallel);
+  let invD = 1.0 / safeDirection;
+  let t0 = (aabb[0] - ray.ro) * invD;
+  let t1 = (aabb[1] - ray.ro) * invD;
+  let entry = select(min(t0, t1), vec3f(-INF), parallel);
+  let exit = select(max(t0, t1), vec3f(INF), parallel);
+  let tNear = max(max(entry.x, entry.y), entry.z);
+  let tFar = min(min(exit.x, exit.y), exit.z);
+
+  if tFar + 1e-5 < max(tNear, 0.0) {
+    return Hit(INF, vec3f(0.0), vec3f(0.0), vec4f(0.0), Material(0.0, 0.0));
+  }
+
   let isNear = tNear >= 0.0;
   let t = select(tFar, tNear, isNear);
-  let p = ray.ro + ray.rd * (t - eps);
 
-  let onMin = abs(p - aabb[0]) < vec3f(eps);
-  let onMax = abs(p - aabb[1]) < vec3f(eps);
-  let thin = onMin & onMax;
-  let thinNormal = select(sign(ray.rd), -sign(ray.rd), isNear);
-  var normal = vec3f(0.0);
-  normal = select(normal, thinNormal, thin);
-  normal = select(normal, vec3f(-1.0), onMin & !thin);
-  normal = select(normal, vec3f(1.0), onMax & !thin);
-
+  // t is copied from one or more slab bounds. Prefer an exactly collapsed slab at a tie, then
+  // pick the first remaining axis. This gives zero-thickness and edge hits one canonical face
+  // normal without the tolerance scans or per-axis loop used by the slower fixes.
+  let selectedBound = select(exit, entry, isNear);
+  let candidates = selectedBound == vec3f(t);
+  let collapsed = (aabb[0] == aabb[1]) & !parallel;
+  let preferred = select(candidates, collapsed, any(collapsed));
+  let previousAxis = vec3<bool>(false, preferred.x, preferred.x | preferred.y);
+  let face = preferred & !previousAxis;
+  let faceDirection = select(sign(ray.rd), -sign(ray.rd), isNear);
+  let normal = select(vec3f(0.0), faceDirection, face);
+  let p = ray.ro + ray.rd * (t - HIT_EPS);
   return Hit(t, p, normal, vec4f(0.0), Material(0.0, 0.0));
+}
+
+fn insideVisualSheet(ray: Ray, hit: Hit, aabb: mat2x3f) -> bool {
+  // Classify the true intersection, not the point biased backward for texture/shadow behavior.
+  let geometricP = ray.ro + ray.rd * hit.t;
+  let finiteAxis = aabb[1] > aabb[0];
+  let interior =
+    (geometricP > aabb[0] + vec3f(SHEET_EDGE_EPS)) &
+    (geometricP < aabb[1] - vec3f(SHEET_EDGE_EPS));
+  return all(!finiteAxis | interior);
 }
 
 fn calculateCollision(ray: Ray, directLight: bool, bank: u32, component: u32) -> Hit {
@@ -135,6 +157,17 @@ fn calculateCollision(ray: Ray, directLight: bool, bank: u32, component: u32) ->
     }
 
     let hit = hitAABB(ray, box.aabb);
+    // Misses and occluded boxes cannot replace nearestHit. Reject them before the UV work and
+    // texture load; this also makes the robust slab handling cheaper than the old hot path.
+    if !(hit.t < nearestHit.t) {
+      continue;
+    }
+    // The lit redstone model uses zero-thickness alpha-cutout sheets. Treat their outer edges as
+    // open so an exact edge hit cannot wrap through fract() to a bright texel row.
+    if (box.flags & REDSTONE_SHEET_FLAG) != 0u && !insideVisualSheet(ray, hit, box.aabb) {
+      continue;
+    }
+
     let a = abs(hit.normal);
     let u_axis = vec3f(a.y + a.z, a.x, 0.0);
     let v_axis = vec3f(0.0, a.z, a.x + a.y);
@@ -159,7 +192,7 @@ fn calculateCollision(ray: Ray, directLight: bool, bank: u32, component: u32) ->
       }
     }
 
-    if hit.t < nearestHit.t && lit.a > 0.5 {
+    if lit.a > 0.5 {
       nearestHit = hit;
       nearestHit.color = lit;
       let effectiveLight = select(0.0, box.material.light_level, belongsToComponent);
