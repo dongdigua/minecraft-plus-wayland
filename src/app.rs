@@ -171,6 +171,7 @@ impl LockSetup {
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let startup = parse_startup_options();
+    println!("{}", crate::splash::pick_splash()?);
     // Validate the interval and establish the shared module timeline before requesting a session
     // lock. Returning an ordinary startup error after lock() would drop a requested lock object.
     let module_started_at = Instant::now();
