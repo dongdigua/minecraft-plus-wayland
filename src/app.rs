@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
+use clap::{Arg, ArgAction, ArgMatches, Command, error::ErrorKind, value_parser};
 use rand::Rng;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
@@ -71,7 +71,7 @@ enum StartupMode {
     SessionLock,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModuleSelection {
     LoadCube,
     ItemPop,
@@ -141,11 +141,52 @@ impl ModuleSelection {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModuleList {
+    All,
+    Selected(Vec<u8>),
+}
+
+#[derive(Clone, Debug)]
+enum ModuleSchedule {
+    Random {
+        pool: Vec<ModuleSelection>,
+    },
+    Sequential {
+        pool: Vec<ModuleSelection>,
+        next_index: usize,
+    },
+}
+
+impl ModuleSchedule {
+    fn initial_module(&self) -> ModuleSelection {
+        match self {
+            Self::Random { pool } => {
+                let index = rand::thread_rng().gen_range(0, pool.len());
+                pool[index]
+            }
+            Self::Sequential { pool, .. } => pool[0],
+        }
+    }
+
+    fn next_module(&mut self, current: ModuleSelection) -> ModuleSelection {
+        match self {
+            Self::Random { pool } => random_module_excluding(pool, current),
+            Self::Sequential { pool, next_index } => {
+                let selection = pool[*next_index % pool.len()];
+                *next_index = (*next_index + 1) % pool.len();
+                selection
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct StartupOptions {
     mode: StartupMode,
     module: ModuleSelection,
     module_switch_interval: Option<Duration>,
+    module_schedule: Option<ModuleSchedule>,
 }
 
 struct LockSetup {
@@ -170,16 +211,20 @@ impl LockSetup {
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
-    let startup = parse_startup_options();
+    let StartupOptions {
+        mode,
+        module,
+        module_switch_interval,
+        module_schedule,
+    } = parse_startup_options();
     println!("{}", crate::splash::pick_splash()?);
     // Validate the interval and establish the shared module timeline before requesting a session
     // lock. Returning an ordinary startup error after lock() would drop a requested lock object.
     let module_started_at = Instant::now();
-    let next_module_switch =
-        initial_module_deadline(module_started_at, startup.module_switch_interval)?;
+    let next_module_switch = initial_module_deadline(module_started_at, module_switch_interval)?;
     // Identity, dump hardening, worker construction and the editable secret all succeed before the
     // client requests a session lock.
-    let mut lock_setup = match startup.mode {
+    let mut lock_setup = match mode {
         StartupMode::LayerShell => None,
         StartupMode::SessionLock => Some(LockSetup::new()?),
     };
@@ -197,7 +242,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let outputs = output_state.outputs().collect::<Vec<_>>();
     let mut lock_replies = None;
-    let (mode, session_lock_state) = match startup.mode {
+    let (mode, session_lock_state) = match mode {
         StartupMode::LayerShell => {
             let layer_shell = LayerShell::bind(&globals, &qh)?;
             let surface = compositor_state.create_surface(&qh);
@@ -214,7 +259,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             layer.set_keyboard_interactivity(KeyboardInteractivity::None);
             let render = RenderState::new(
                 Renderer::new(&connection, layer.wl_surface())?,
-                startup.module,
+                module,
                 false,
                 module_started_at,
             );
@@ -262,9 +307,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         registry_state,
         seat_state,
         keyboards: Vec::new(),
-        module_selection: startup.module,
+        module_selection: module,
         module_started_at,
-        module_switch_interval: startup.module_switch_interval,
+        module_switch_interval,
+        module_schedule,
         next_module_switch,
         loop_handle: loop_handle.clone(),
         deadline_timer: None,
@@ -354,9 +400,11 @@ fn cli_command() -> Command {
                 .short('m')
                 .long("module")
                 .value_name("MODULE")
-                .help("Render one fixed Web module; conflicts with --interval")
+                .help("Render one fixed module; conflicts with --interval, --rand and --seq")
                 .value_parser(value_parser!(u8).range(0..=12))
-                .conflicts_with("interval"),
+                .conflicts_with("interval")
+                .conflicts_with("rand")
+                .conflicts_with("seq"),
         )
         .arg(
             Arg::new("interval")
@@ -366,37 +414,176 @@ fn cli_command() -> Command {
                 .help("Switch modules every whole number of seconds; 0 disables switching")
                 .value_parser(value_parser!(u64)),
         )
+        .arg(
+            Arg::new("rand")
+                .long("rand")
+                .value_name("MODULES")
+                .num_args(0..=1)
+                .default_missing_value("")
+                .help("Switch to a random module every interval; optional comma-separated module list")
+                .conflicts_with("module")
+                .conflicts_with("seq")
+                .requires("interval"),
+        )
+        .arg(
+            Arg::new("seq")
+                .long("seq")
+                .value_name("MODULES")
+                .num_args(0..=1)
+                .default_missing_value("")
+                .help("Switch to the next module in order every interval; optional comma-separated module list")
+                .conflicts_with("module")
+                .conflicts_with("rand")
+                .requires("interval"),
+        )
 }
 
 fn parse_startup_options() -> StartupOptions {
-    startup_options_from_matches(cli_command().get_matches())
+    let mut command = cli_command();
+    let matches = command.clone().get_matches();
+    match startup_options_from_matches(&mut command, matches) {
+        Ok(options) => options,
+        Err(error) => error.exit(),
+    }
 }
 
 #[cfg(test)]
 fn parse_options(
     arguments: impl IntoIterator<Item = String>,
 ) -> Result<StartupOptions, clap::Error> {
-    cli_command()
-        .try_get_matches_from(
-            std::iter::once(String::from("minecraft-plus-wayland")).chain(arguments),
-        )
-        .map(startup_options_from_matches)
+    let mut command = cli_command();
+    let matches = command.try_get_matches_from_mut(
+        std::iter::once(String::from("minecraft-plus-wayland")).chain(arguments),
+    )?;
+    startup_options_from_matches(&mut command, matches)
 }
 
-fn startup_options_from_matches(matches: ArgMatches) -> StartupOptions {
+fn parse_module_list(value: &str) -> Result<Vec<u8>, String> {
+    if value.is_empty() {
+        return Err("module list must not be empty".to_owned());
+    }
+    let mut ids = Vec::new();
+    for entry in value.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err("module list contains an empty entry".to_owned());
+        }
+        let id: u8 = entry
+            .parse()
+            .map_err(|_| format!("invalid module id `{entry}`"))?;
+        if id > 12 {
+            return Err(format!("module id {id} is out of range 0..=12"));
+        }
+        if ids.contains(&id) {
+            return Err(format!("duplicate module id {id}"));
+        }
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+fn parse_module_list_arg(
+    command: &mut Command,
+    value: Option<&str>,
+) -> Result<Option<ModuleList>, clap::Error> {
+    match value {
+        None => Ok(None),
+        Some("") => Ok(Some(ModuleList::All)),
+        Some(value) => parse_module_list(value)
+            .map(ModuleList::Selected)
+            .map(Some)
+            .map_err(|message| command.error(ErrorKind::ValueValidation, message)),
+    }
+}
+
+fn module_pool(list: &ModuleList) -> Vec<ModuleSelection> {
+    match list {
+        ModuleList::All => (0..=12)
+            .map(|id| ModuleSelection::from_id(id).expect("static module table covers 0..=12"))
+            .collect(),
+        ModuleList::Selected(ids) => ids
+            .iter()
+            .map(|id| {
+                ModuleSelection::from_id(*id)
+                    .expect("module list parser restricts ids to the 13-entry module table")
+            })
+            .collect(),
+    }
+}
+
+fn startup_options_from_matches(
+    command: &mut Command,
+    matches: ArgMatches,
+) -> Result<StartupOptions, clap::Error> {
     let mode = if matches.get_flag("lock") {
         StartupMode::SessionLock
     } else {
         StartupMode::LayerShell
     };
-    let module = matches
-        .get_one::<u8>("module")
-        .copied()
-        .map(|module_id| {
-            ModuleSelection::from_id(module_id)
-                .expect("clap restricts module IDs to the 13-entry module table")
-        })
-        .unwrap_or_else(|| {
+
+    let interval_seconds = matches.get_one::<u64>("interval").copied();
+    let rand_list = parse_module_list_arg(
+        command,
+        matches.get_one::<String>("rand").map(String::as_str),
+    )?;
+    let seq_list = parse_module_list_arg(
+        command,
+        matches.get_one::<String>("seq").map(String::as_str),
+    )?;
+
+    if (rand_list.is_some() || seq_list.is_some())
+        && !matches!(interval_seconds, Some(seconds) if seconds > 0)
+    {
+        return Err(command.error(
+            ErrorKind::ValueValidation,
+            "--rand/--seq require --interval with a positive number of seconds",
+        ));
+    }
+
+    let module_switch_interval = interval_seconds
+        .filter(|seconds| *seconds != 0)
+        .map(Duration::from_secs);
+
+    let (module, module_schedule) =
+        if let Some(module_id) = matches.get_one::<u8>("module").copied() {
+            let selection = ModuleSelection::from_id(module_id)
+                .expect("clap restricts module IDs to the 13-entry module table");
+            (selection, None)
+        } else if let Some(rand_list) = rand_list {
+            let schedule = ModuleSchedule::Random {
+                pool: module_pool(&rand_list),
+            };
+            let selection = schedule.initial_module();
+            log::info!(
+                target: "minecraft_plus_wayland::startup",
+                "random module schedule started with module={}",
+                selection.id(),
+            );
+            (selection, Some(schedule))
+        } else if let Some(seq_list) = seq_list {
+            let schedule = ModuleSchedule::Sequential {
+                pool: module_pool(&seq_list),
+                next_index: 1,
+            };
+            let selection = schedule.initial_module();
+            log::info!(
+                target: "minecraft_plus_wayland::startup",
+                "sequential module schedule started with module={}",
+                selection.id(),
+            );
+            (selection, Some(schedule))
+        } else if module_switch_interval.is_some() {
+            let schedule = ModuleSchedule::Random {
+                pool: module_pool(&ModuleList::All),
+            };
+            let selection = schedule.initial_module();
+            log::info!(
+                target: "minecraft_plus_wayland::startup",
+                "interval selected initial module={}",
+                selection.id(),
+            );
+            (selection, Some(schedule))
+        } else {
             let module_id = rand::thread_rng().gen_range(0, 13);
             let selection = ModuleSelection::from_id(module_id)
                 .expect("random module id must remain inside the 13-entry module table");
@@ -405,19 +592,15 @@ fn startup_options_from_matches(matches: ArgMatches) -> StartupOptions {
                 "no --module argument supplied; randomly selected module={}",
                 selection.id(),
             );
-            selection
-        });
-    let module_switch_interval = matches
-        .get_one::<u64>("interval")
-        .copied()
-        .filter(|seconds| *seconds != 0)
-        .map(Duration::from_secs);
+            (selection, None)
+        };
 
-    StartupOptions {
+    Ok(StartupOptions {
         mode,
         module,
         module_switch_interval,
-    }
+        module_schedule,
+    })
 }
 
 fn initial_module_deadline(
@@ -433,20 +616,34 @@ fn initial_module_deadline(
         .transpose()
 }
 
-fn module_id_excluding(current: u8, random_slot: u8) -> u8 {
-    debug_assert!(current < 13);
-    debug_assert!(random_slot < 12);
-    if random_slot >= current {
-        random_slot + 1
+fn module_excluding_slot(
+    pool: &[ModuleSelection],
+    current: ModuleSelection,
+    slot: usize,
+) -> ModuleSelection {
+    debug_assert!(pool.len() >= 2);
+    let Some(current_index) = pool.iter().position(|&selection| selection == current) else {
+        return pool[slot % pool.len()];
+    };
+    let slot = slot % (pool.len() - 1);
+    let index = if slot == current_index {
+        pool.len() - 1
     } else {
-        random_slot
-    }
+        slot
+    };
+    pool[index]
 }
 
-fn random_module_excluding(current: ModuleSelection) -> ModuleSelection {
-    let random_slot = rand::thread_rng().gen_range(0, 12);
-    ModuleSelection::from_id(module_id_excluding(current.id(), random_slot))
-        .expect("random replacement module id must remain inside the 13-entry module table")
+fn random_module_excluding(pool: &[ModuleSelection], current: ModuleSelection) -> ModuleSelection {
+    debug_assert!(!pool.is_empty());
+    if pool.len() == 1 {
+        return pool[0];
+    }
+    module_excluding_slot(
+        pool,
+        current,
+        rand::thread_rng().gen_range(0, pool.len() - 1),
+    )
 }
 
 fn advance_periodic_deadline(
@@ -653,6 +850,7 @@ struct App {
     module_selection: ModuleSelection,
     module_started_at: Instant,
     module_switch_interval: Option<Duration>,
+    module_schedule: Option<ModuleSchedule>,
     next_module_switch: Option<Instant>,
     loop_handle: LoopHandle<'static, App>,
     deadline_timer: Option<RegistrationToken>,
@@ -1109,7 +1307,11 @@ impl App {
         }
         let next_deadline = advance_periodic_deadline(deadline, interval, now)
             .ok_or("cannot schedule the next module switch")?;
-        let module_selection = random_module_excluding(self.module_selection);
+        let module_selection = self
+            .module_schedule
+            .as_mut()
+            .expect("module switch interval implies a module schedule")
+            .next_module(self.module_selection);
         self.replace_modules(module_selection, now, qh)?;
         self.next_module_switch = Some(next_deadline);
         Ok(())
@@ -1655,8 +1857,9 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::{
-        StartupMode, advance_periodic_deadline, all_outputs_presented, continuous_frame_required,
-        earliest_deadline, initial_module_deadline, module_id_excluding, parse_options,
+        ModuleSchedule, ModuleSelection, StartupMode, advance_periodic_deadline,
+        all_outputs_presented, continuous_frame_required, earliest_deadline,
+        initial_module_deadline, module_excluding_slot, parse_options,
         session_lock_render_retry_deadline,
     };
     use crate::{
@@ -1666,6 +1869,12 @@ mod tests {
 
     fn options(arguments: &[&str]) -> Result<super::StartupOptions, clap::Error> {
         parse_options(arguments.iter().map(|argument| (*argument).to_owned()))
+    }
+
+    fn all_module_selections() -> Vec<ModuleSelection> {
+        (0..=12)
+            .map(|id| ModuleSelection::from_id(id).expect("static module table covers 0..=12"))
+            .collect()
     }
 
     #[test]
@@ -1729,12 +1938,119 @@ mod tests {
         assert_eq!(help.kind(), ErrorKind::DisplayHelp);
         assert!(help.to_string().contains("--module <MODULE>"));
         assert!(help.to_string().contains("conflicts with --interval"));
+        assert!(help.to_string().contains("--rand"));
+        assert!(help.to_string().contains("--seq"));
         assert!(help.to_string().contains("12  creeper"));
 
         assert_eq!(
             options(&["--module", "13"]).unwrap_err().kind(),
             ErrorKind::ValueValidation
         );
+    }
+
+    #[test]
+    fn rand_with_subset_restricts_the_pool() {
+        let parsed = options(&["--rand", "0,1,2,11,12", "-t", "5"]).unwrap();
+        assert_eq!(parsed.module_switch_interval, Some(Duration::from_secs(5)));
+        let Some(ModuleSchedule::Random { pool }) = parsed.module_schedule else {
+            panic!("expected a random module schedule");
+        };
+        assert_eq!(
+            pool.iter().map(|m| m.id()).collect::<Vec<_>>(),
+            vec![0u8, 1, 2, 11, 12]
+        );
+    }
+
+    #[test]
+    fn seq_cycles_the_selected_modules_in_order() {
+        let parsed = options(&["--seq", "3,4,5,6", "-t", "2"]).unwrap();
+        assert_eq!(parsed.module_switch_interval, Some(Duration::from_secs(2)));
+        let Some(ModuleSchedule::Sequential { pool, next_index }) = parsed.module_schedule else {
+            panic!("expected a sequential module schedule");
+        };
+        assert_eq!(next_index, 1);
+        assert_eq!(
+            pool.iter().map(|m| m.id()).collect::<Vec<_>>(),
+            vec![3u8, 4, 5, 6]
+        );
+        assert_eq!(parsed.module.id(), 3);
+    }
+
+    #[test]
+    fn seq_without_a_list_cycles_all_modules() {
+        let parsed = options(&["--seq", "-t", "1"]).unwrap();
+        let Some(ModuleSchedule::Sequential { pool, next_index }) = parsed.module_schedule else {
+            panic!("expected a sequential module schedule");
+        };
+        assert_eq!(next_index, 1);
+        assert_eq!(pool.len(), 13);
+        assert_eq!(pool.first().map(|m| m.id()), Some(0u8));
+        assert_eq!(parsed.module.id(), 0);
+    }
+
+    #[test]
+    fn interval_alone_schedules_random_over_all_modules() {
+        let parsed = options(&["-t", "7"]).unwrap();
+        assert_eq!(parsed.module_switch_interval, Some(Duration::from_secs(7)));
+        assert!(matches!(
+            parsed.module_schedule.as_ref(),
+            Some(ModuleSchedule::Random { .. })
+        ));
+    }
+
+    #[test]
+    fn rand_and_seq_require_interval() {
+        for arguments in [
+            &["--rand"][..],
+            &["--rand", "0,1,2"][..],
+            &["--seq"][..],
+            &["--seq", "3,4,5,6"][..],
+        ] {
+            assert_eq!(
+                options(arguments).unwrap_err().kind(),
+                ErrorKind::MissingRequiredArgument
+            );
+        }
+    }
+
+    #[test]
+    fn rand_and_seq_reject_a_zero_interval() {
+        for arguments in [&["--rand", "-t", "0"][..], &["--seq", "1,2", "-t", "0"][..]] {
+            assert_eq!(
+                options(arguments).unwrap_err().kind(),
+                ErrorKind::ValueValidation
+            );
+        }
+    }
+
+    #[test]
+    fn rand_and_seq_conflict_with_module_and_each_other() {
+        for arguments in [
+            &["--rand", "-t", "1", "-m", "3"][..],
+            &["--seq", "1,2", "-t", "1", "--module", "3"][..],
+            &["--rand", "--seq", "-t", "1"][..],
+            &["--seq", "--rand", "-t", "1"][..],
+        ] {
+            assert_eq!(
+                options(arguments).unwrap_err().kind(),
+                ErrorKind::ArgumentConflict
+            );
+        }
+    }
+
+    #[test]
+    fn module_list_rejects_invalid_duplicate_and_out_of_range_ids() {
+        for arguments in [
+            &["--rand", "3,3", "-t", "1"][..],
+            &["--rand", "13", "-t", "1"][..],
+            &["--seq", "a,b", "-t", "1"][..],
+            &["--seq", "1,,2", "-t", "1"][..],
+        ] {
+            assert_eq!(
+                options(arguments).unwrap_err().kind(),
+                ErrorKind::ValueValidation
+            );
+        }
     }
 
     #[test]
@@ -1753,15 +2069,55 @@ mod tests {
 
     #[test]
     fn replacement_slot_mapping_is_uniform_and_never_repeats_current_module() {
-        for current in 0..13 {
+        let pool = all_module_selections();
+        for current in &pool {
             let mut ids = (0..12)
-                .map(|slot| module_id_excluding(current, slot))
+                .map(|slot| module_excluding_slot(&pool, *current, slot).id())
                 .collect::<Vec<_>>();
-            assert!(ids.iter().all(|id| *id != current && *id < 13));
+            assert!(ids.iter().all(|id| *id != current.id()));
             ids.sort_unstable();
             ids.dedup();
             assert_eq!(ids.len(), 12);
         }
+    }
+
+    #[test]
+    fn sequential_schedule_cycles_in_the_given_order() {
+        let pool = vec![
+            ModuleSelection::from_id(3).unwrap(),
+            ModuleSelection::from_id(4).unwrap(),
+            ModuleSelection::from_id(5).unwrap(),
+            ModuleSelection::from_id(6).unwrap(),
+        ];
+        let mut schedule = ModuleSchedule::Sequential {
+            pool,
+            next_index: 1,
+        };
+        assert_eq!(schedule.initial_module().id(), 3);
+        assert_eq!(
+            schedule
+                .next_module(ModuleSelection::from_id(3).unwrap())
+                .id(),
+            4
+        );
+        assert_eq!(
+            schedule
+                .next_module(ModuleSelection::from_id(4).unwrap())
+                .id(),
+            5
+        );
+        assert_eq!(
+            schedule
+                .next_module(ModuleSelection::from_id(5).unwrap())
+                .id(),
+            6
+        );
+        assert_eq!(
+            schedule
+                .next_module(ModuleSelection::from_id(6).unwrap())
+                .id(),
+            3
+        );
     }
 
     #[test]
