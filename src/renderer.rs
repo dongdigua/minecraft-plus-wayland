@@ -74,6 +74,17 @@ impl Renderer {
             compatible_surface: Some(&surface),
             ..Default::default()
         }))?;
+        let adapter_info = adapter.get_info();
+        log::info!(
+            target: "minecraft_plus_wayland::surface",
+            "wgpu adapter selected: name={:?}, backend={:?}, device_type={:?}, driver={:?}, \
+             driver_info={:?}",
+            adapter_info.name,
+            adapter_info.backend,
+            adapter_info.device_type,
+            adapter_info.driver,
+            adapter_info.driver_info,
+        );
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("minecraft-plus-wayland device"),

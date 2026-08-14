@@ -178,7 +178,7 @@ fn calculateCollision(ray: Ray, directLight: bool, bank: u32, component: u32) ->
     let uv = hit.p * mat2x3f(u_axis, v_axis) + off;
     let texUV = vec2u(floor(fract(uv) * 16.0));
 
-    var lit = textureLoad(torchTextures, texUV, box.texidx, 0u);
+    var lit = textureLoad(torchTextures, texUV, box.texidx, 0);
     let owner = boxLightOwner(box.flags);
     let belongsToComponent = owner == component;
 

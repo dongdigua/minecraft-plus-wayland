@@ -4,6 +4,13 @@ use crate::modules::{RenderContext, RenderSize};
 
 const SHADER: &str = include_str!("torch.wgsl");
 const ACCUMULATION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const MATERIAL_TEXTURE_SIZE: u32 = 16;
+const MATERIAL_LAYER_COUNT: u32 = 6;
+// wgpu-hal 30's GLES backend classifies a square six-layer D2 texture as a cubemap before it
+// sees the requested view dimension. One unused layer keeps the native target D2Array while the
+// six logical material indices and shader behavior remain unchanged.
+const MATERIAL_STORAGE_LAYERS: u32 = MATERIAL_LAYER_COUNT + 1;
+const MATERIAL_LAYER_BYTES: usize = (MATERIAL_TEXTURE_SIZE * MATERIAL_TEXTURE_SIZE * 4) as usize;
 const CACHE_LAYERS: u32 = 4;
 const MAX_CACHE_UPDATES: u32 = 512;
 const TOTAL_CACHE_UPDATES: u32 = MAX_CACHE_UPDATES * CACHE_LAYERS;
@@ -185,7 +192,10 @@ impl TorchAnimation {
 
     fn initialize_static(&mut self, context: &RenderContext<'_>) -> Result<(), Box<dyn Error>> {
         let mut images = crate::resources::load_torch_textures()?;
-        if images.iter().any(|image| image.dimensions() != (16, 16)) {
+        if images
+            .iter()
+            .any(|image| image.dimensions() != (MATERIAL_TEXTURE_SIZE, MATERIAL_TEXTURE_SIZE))
+        {
             return Err("all torch animation textures must be 16x16 PNGs".into());
         }
         for image in &mut images {
@@ -194,9 +204,9 @@ impl TorchAnimation {
         let texture = context.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("torch material texture array"),
             size: wgpu::Extent3d {
-                width: 16,
-                height: 16,
-                depth_or_array_layers: images.len() as u32,
+                width: MATERIAL_TEXTURE_SIZE,
+                height: MATERIAL_TEXTURE_SIZE,
+                depth_or_array_layers: MATERIAL_STORAGE_LAYERS,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -220,19 +230,46 @@ impl TorchAnimation {
                 image.as_raw(),
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(16 * 4),
-                    rows_per_image: Some(16),
+                    bytes_per_row: Some(MATERIAL_TEXTURE_SIZE * 4),
+                    rows_per_image: Some(MATERIAL_TEXTURE_SIZE),
                 },
                 wgpu::Extent3d {
-                    width: 16,
-                    height: 16,
+                    width: MATERIAL_TEXTURE_SIZE,
+                    height: MATERIAL_TEXTURE_SIZE,
                     depth_or_array_layers: 1,
                 },
             );
         }
+        debug_assert_eq!(images.len() as u32, MATERIAL_LAYER_COUNT);
+        let transparent_padding = [0; MATERIAL_LAYER_BYTES];
+        context.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: MATERIAL_LAYER_COUNT,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &transparent_padding,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(MATERIAL_TEXTURE_SIZE * 4),
+                rows_per_image: Some(MATERIAL_TEXTURE_SIZE),
+            },
+            wgpu::Extent3d {
+                width: MATERIAL_TEXTURE_SIZE,
+                height: MATERIAL_TEXTURE_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("torch material texture array view"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
+            base_array_layer: 0,
+            array_layer_count: Some(MATERIAL_STORAGE_LAYERS),
             ..Default::default()
         });
         let trace_uniforms = context.device.create_buffer(&wgpu::BufferDescriptor {
@@ -860,6 +897,18 @@ mod tests {
         )
         .validate(&module)
         .expect("torch WGSL validates");
+    }
+
+    #[test]
+    fn material_texture_storage_cannot_be_misclassified_as_cube() {
+        assert_eq!(MATERIAL_LAYER_COUNT, 6);
+        assert_eq!(MATERIAL_STORAGE_LAYERS, 7);
+        assert!(!MATERIAL_STORAGE_LAYERS.is_multiple_of(6));
+        assert!(
+            scene_boxes()
+                .iter()
+                .all(|box_data| box_data.texture_index < MATERIAL_LAYER_COUNT)
+        );
     }
 
     #[test]
