@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 dongdigua
+// SPDX-License-Identifier: MIT
+
 struct Uniforms {
     viewport: vec2<f32>,
     approach_progress: f32,

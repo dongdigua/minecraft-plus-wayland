@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 dongdigua
+// SPDX-License-Identifier: MIT
+
 struct Uniforms {
   camera_dir: mat2x3f,
   fov: f32,
